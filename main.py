@@ -38,7 +38,7 @@ def loco_fwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, block, eps=1e-5):
     out = torch.einsum('bgi,gij->bgj', a, W2) + b2
     return out.reshape(x_s.size(0), -1) + x
 
-
+@torch.compile(mode='max-autotune-no-cudagraphs')
 def bwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, block, grad_on_output_hidden, compute_target, eps=1e-5):
     B, D = x.shape
     x_s = shuffle(x, groups)
@@ -70,6 +70,7 @@ def bwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, block, grad_on_output_hidden, com
 
     return dout, target, dln_w, dln_b, dW1, db1, dW2, db2
 
+
 @torch.compile(mode='max-autotune-no-cudagraphs')
 def optim(params, grads, states, lr, beta, wd):
     for p, g, s in zip(params, grads, states):
@@ -77,10 +78,9 @@ def optim(params, grads, states, lr, beta, wd):
         p -= lr * (s.sign() * g.norm() / g.numel() ** 0.5 + p * wd)
 
 
-
 # @torch.compile(mode='max-autotune-no-cudagraphs')
-def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr, n_steps, BATCH, BLOCK,
-                           GROUPS, EPS=1e-5, wd: float = 0.1, beta=0.9):
+def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr, n_steps, BATCH, BLOCK, GROUPS,
+                  EPS=1e-5, wd: float = 0.0, beta=0.9):
     lr = lr / BATCH / BLOCK
     params = ln_w, ln_b, W1, b1, W2, b2
     states = [torch.zeros_like(p) for p in params]
@@ -163,13 +163,12 @@ class LocoShuffleMLPBlock(ShuffleMLPBlock):
 
     def loco_step(self, train_x: Tensor, target: Tensor):
         locoprop_step(train_x, target, self.ln.weight, self.ln.bias, self.W1, self.b1, self.W2, self.b2, self.lr,
-                          self.loco_steps, BATCH=train_x.size(0), BLOCK=self.block, GROUPS=self.groups)
-
+                      self.loco_steps, BATCH=train_x.size(0), BLOCK=self.block, GROUPS=self.groups)
 
     def backward_step(self, x: Tensor, grad_out: Tensor, grad_in: Tensor):
         """Fused backward: recompute forward from x, backprop grad_out -> grad_in."""
         locoprop_backward(x, grad_out, grad_in, self.ln.weight, self.ln.bias, self.W1, self.b1, self.W2, self.b2,
-                              BLOCK=self.block, GROUPS=self.groups)
+                          BLOCK=self.block, GROUPS=self.groups)
 
 
 class DenseMLPBlock(nn.Module):
@@ -270,17 +269,6 @@ def cached_prevprime(n):
 
 
 @torch.compile(mode='max-autotune-no-cudagraphs', fullgraph=True)
-def data(embd: nn.Embedding, batch: int, prime: int):
-    x0 = torch.randint(embd.num_embeddings, (batch,), device=embd.weight.device)
-    x1 = torch.randint(embd.num_embeddings, (batch,), device=embd.weight.device)
-    tgt0 = (x0 + x1) % prime
-    tgt1 = (x0 - x1) % prime
-    src = torch.stack([x0, x1], -1)
-    tgt = torch.stack([tgt0, tgt1], -1)
-    return embd(src).flatten(-2).detach(), embd(tgt).flatten(-2).detach()
-
-
-@torch.compile(mode='max-autotune-no-cudagraphs', fullgraph=True)
 def solve_loss(template: Tensor, fn, steps: int):  # SGD without momentum finds the optimum very fast and consistently
     yp = torch.zeros_like(template)
     for i in range(steps):
@@ -292,6 +280,16 @@ def solve_loss(template: Tensor, fn, steps: int):  # SGD without momentum finds 
     return yp.detach()
 
 
+class Teacher(nn.Module):
+    def __init__(self, dim, hidden):
+        super().__init__()
+        self.inproj = nn.Linear(dim, hidden)
+        self.outproj = nn.Linear(hidden, dim)
+
+    def forward(self, x):
+        return self.outproj(F.relu(self.inproj(x)))
+
+
 def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float, device: str, print_every: int,
           numbers: int | None = None, loss_fn=F.mse_loss, loss_steps: int = 32):
     if model.is_loco:
@@ -301,9 +299,10 @@ def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float,
         target_lr = None
         opt = torch.optim.AdamW(model.parameters(), lr=lr, fused=True, weight_decay=0.0)
     train_losses = []
-    embd = nn.Embedding(128, dim // 2).to(device)
+
     loss_buffer = torch.zeros((print_every,), device=device, dtype=torch.float64)
 
+    teacher = Teacher(dim, dim).to(device)
     model: ResidualMLP = torch.compile(model, mode='max-autotune-no-cudagraphs')
 
     start = 0
@@ -311,7 +310,10 @@ def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float,
     best_loss = float('inf')
 
     for step in range(train_steps + 1):
-        src, tgt = data(embd, batch, cached_prevprime(embd.num_embeddings))
+        src = torch.randn((batch, dim), device=device)
+        with torch.no_grad():
+            tgt = teacher(src).detach()
+            src = src.detach()
 
         if model.is_loco:
             if model.autograd_targets:
@@ -355,10 +357,10 @@ def run_varying_lr(lr_range, model, epochs, batch, dim, device, print_every):
 @app.command()
 def main(groups: int = typer.Option(16, help="Number of parallel groups"),
          block: int = typer.Option(64, help="Block size per group"), batch: int = typer.Option(1024, help="Batch size"),
-         layers: int = typer.Option(32, help="Number of layers"),
-         epochs: int = typer.Option(1024, help="Training epochs"), lr: float = typer.Option(0.1, help="Learning rate"),
+         layers: int = typer.Option(8, help="Number of layers"),
+         epochs: int = typer.Option(4096, help="Training epochs"), lr: float = typer.Option(0.1, help="Learning rate"),
          wd: float = typer.Option(0.0, help="Weight decay toward original weights in inner loop"),
-         steps: List[int] = typer.Option([1, 16, 64], help="LocoProp steps"),
+         steps: List[int] = typer.Option([1, 16, 256], help="LocoProp steps"),
          seed: int = typer.Option(42, help="Random seed"), print_every: int = typer.Option(256, help="Print interval"),
          device: str = typer.Option("cuda", help="Device"), ):
     torch.manual_seed(seed)
@@ -368,26 +370,26 @@ def main(groups: int = typer.Option(16, help="Number of parallel groups"),
     print("=" * 70)
 
     results = {}
-    lrs = np.logspace(-1, -0, 1)  # 10 ** -8 to 10 ** -2
+    lrs = np.logspace(-8, -0, 12)  # 10 ** -8 to 10 ** -2
 
-    # print("\n[Backprop - Shuffle]")
-    # torch.manual_seed(seed + 1)
-    # model = ResidualMLP(ShuffleMLPBlock, layers, groups=groups, block=block).to(device)
-    # results["backprop_shuffle"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every)
-    #
-    # sqrt_scale = 2 ** round((groups.bit_length() - 1) / 2)  # nearest pow2 to sqrt(groups)
-    # hidden = sqrt_scale * block
-    # print(f"\n[Backprop - Dense (hidden={hidden}, {dim / hidden:.1f}x bottleneck)]")
-    # torch.manual_seed(seed + 1)
-    # model = ResidualMLP(DenseMLPBlock, layers, dim=dim, hidden=hidden).to(device)
-    # results["backprop_dense"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every)
+    print("\n[Backprop - Shuffle]")
+    torch.manual_seed(seed + 1)
+    model = ResidualMLP(ShuffleMLPBlock, layers, groups=groups, block=block).to(device)
+    results["backprop_shuffle"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every)
+
+    sqrt_scale = 2 ** round((groups.bit_length() - 1) / 2)  # nearest pow2 to sqrt(groups)
+    hidden = sqrt_scale * block
+    print(f"\n[Backprop - Dense (hidden={hidden}, {dim / hidden:.1f}x bottleneck)]")
+    torch.manual_seed(seed + 1)
+    model = ResidualMLP(DenseMLPBlock, layers, dim=dim, hidden=hidden).to(device)
+    results["backprop_dense"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every)
 
     for s in steps:
-        # print(f"\n[LocoProp {s} - Staged O(n²)]")
-        # torch.manual_seed(seed + 1)
-        # model = ResidualMLP(LocoShuffleMLPBlock, layers, groups=groups, block=block, loco_steps=s, lr=lr, wd=wd,
-        #                     autograd_targets=False).to(device)
-        # results[f"loco_{s}_staged"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every)
+        print(f"\n[LocoProp {s} - Staged O(n²)]")
+        torch.manual_seed(seed + 1)
+        model = ResidualMLP(LocoShuffleMLPBlock, layers, groups=groups, block=block, loco_steps=s, lr=lr, wd=wd,
+                            autograd_targets=False).to(device)
+        results[f"loco_{s}_staged"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every)
 
         print(f"\n[LocoProp {s} - Autograd O(n)]")
         torch.manual_seed(seed + 1)
