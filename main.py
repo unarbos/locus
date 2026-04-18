@@ -72,7 +72,7 @@ def bwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, block, grad_on_output_hidden, com
 
 
 # @torch.compile(mode='max-autotune-no-cudagraphs')
-def locoprop_step_nokernel(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr, n_steps, BATCH, BLOCK,
+def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr, n_steps, BATCH, BLOCK,
                            GROUPS, EPS=1e-5, wd: float = 0.1):
     lr = lr / BATCH / BLOCK
     dws = []
@@ -87,7 +87,7 @@ def locoprop_step_nokernel(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W
 
 
 @torch.compile(mode='max-autotune-no-cudagraphs')
-def locoprop_backward_nokernel(x, grad_out, grad_in, ln_w, ln_b, W1, b1, W2, b2, BLOCK, GROUPS, EPS=1e-5):
+def locoprop_backward(x, grad_out, grad_in, ln_w, ln_b, W1, b1, W2, b2, BLOCK, GROUPS, EPS=1e-5):
     B, C = x.shape
 
     # recompute forward
@@ -152,32 +152,17 @@ class LocoShuffleMLPBlock(ShuffleMLPBlock):
         return y
 
     def forward_step(self, x: Tensor, output_tensor: Tensor):
-        if x.size(0) >= 64:
-            output_tensor.copy_(super().forward(x))
-            return
-        forward_kernel[(self.groups,)](x, output_tensor, self.ln.weight, self.ln.bias, self.W1, self.b1, self.W2,
-                                       self.b2, BATCH=x.size(0), BLOCK=self.block, GROUPS=self.groups)
+        output_tensor.copy_(super().forward(x))
 
     def loco_step(self, train_x: Tensor, target: Tensor):
-        if train_x.size(0) >= 64:
-            locoprop_step(train_x, target, self.ln.weight, self.ln.bias, self.W1, self.b1, self.W2, self.b2, self.lr,
+        locoprop_step(train_x, target, self.ln.weight, self.ln.bias, self.W1, self.b1, self.W2, self.b2, self.lr,
                           self.loco_steps, BATCH=train_x.size(0), BLOCK=self.block, GROUPS=self.groups)
-            return
 
-        locoprop_kernel[(self.groups,)](train_x, target, self.ln.weight, self.ln.bias, self.W1, self.b1, self.W2,
-                                        self.b2, self.lr, self.loco_steps, BATCH=train_x.shape[0], BLOCK=self.block,
-                                        GROUPS=self.groups)
 
     def backward_step(self, x: Tensor, grad_out: Tensor, grad_in: Tensor):
         """Fused backward: recompute forward from x, backprop grad_out -> grad_in."""
-        if x.size(0) >= 64:
-            locoprop_backward(x, grad_out, grad_in, self.ln.weight, self.ln.bias, self.W1, self.b1, self.W2, self.b2,
+        locoprop_backward(x, grad_out, grad_in, self.ln.weight, self.ln.bias, self.W1, self.b1, self.W2, self.b2,
                               BLOCK=self.block, GROUPS=self.groups)
-            return
-
-        locoprop_backward_kernel[(self.groups,)](x, grad_out, grad_in, self.ln.weight, self.ln.bias, self.W1, self.b1,
-                                                 self.W2, self.b2, BATCH=x.shape[0], BLOCK=self.block,
-                                                 GROUPS=self.groups)
 
 
 class DenseMLPBlock(nn.Module):
