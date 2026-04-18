@@ -70,20 +70,27 @@ def bwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, block, grad_on_output_hidden, com
 
     return dout, target, dln_w, dln_b, dW1, db1, dW2, db2
 
+@torch.compile(mode='max-autotune-no-cudagraphs')
+def optim(params, grads, states, lr, beta, wd):
+    for p, g, s in zip(params, grads, states):
+        s.mul_(beta).add_(1 - beta, g.detach())
+        p -= lr * (s.sign() * g.norm() / g.numel() ** 0.5 + p * wd)
+
+
 
 # @torch.compile(mode='max-autotune-no-cudagraphs')
 def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr, n_steps, BATCH, BLOCK,
-                           GROUPS, EPS=1e-5, wd: float = 0.1):
+                           GROUPS, EPS=1e-5, wd: float = 0.1, beta=0.9):
     lr = lr / BATCH / BLOCK
-    dws = []
-    for i in range(n_steps):
-        dout, grad_on_output_hidden, dln_w, dln_b, dW1, db1, dW2, db2 = bwd(train_x, ln_w, ln_b, W1, b1, W2, b2, GROUPS,
-                                                                            BLOCK, grad_on_output_hidden, i == 0)
-        dws.append(dout.square().sum())
-        eff_lr = min(i + 1, n_steps - i) / ((n_steps + 1) // 2) * lr
+    params = ln_w, ln_b, W1, b1, W2, b2
+    states = [torch.zeros_like(p) for p in params]
 
-        for p, g in ((W1, dW1), (W2, dW2), (ln_w, dln_w), (ln_b, dln_b), (b1, db1), (b2, db2)):
-            p -= eff_lr * (g.sign() * g.norm() / g.numel() ** 0.5 + p * wd)  # print(torch.stack(dws).cpu().numpy())
+    step = torch.arange(n_steps, device=ln_w.device)
+    eff_lr = torch.minimum(step + 1, n_steps - step) / ((n_steps + 1) // 2) * lr
+
+    for i, lr in enumerate(eff_lr):
+        dout, grad_on_output_hidden, *grads = bwd(train_x, *params, GROUPS, BLOCK, grad_on_output_hidden, i == 0)
+        optim(params, grads, states, lr, beta, wd)
 
 
 @torch.compile(mode='max-autotune-no-cudagraphs')
@@ -361,7 +368,7 @@ def main(groups: int = typer.Option(16, help="Number of parallel groups"),
     print("=" * 70)
 
     results = {}
-    lrs = np.logspace(-1, -0, 12)  # 10 ** -8 to 10 ** -2
+    lrs = np.logspace(-1, -0, 1)  # 10 ** -8 to 10 ** -2
 
     # print("\n[Backprop - Shuffle]")
     # torch.manual_seed(seed + 1)
