@@ -79,7 +79,7 @@ def optim(params, grads, lr):
 
 # @torch.compile(mode='max-autotune-no-cudagraphs')
 def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr, n_steps, GROUPS,
-                   cutoff=20):
+                   cutoff=5, min_improvement = 1e-5):
     params_orig = params = ln_w, ln_b, W1, b1, W2, b2
 
     douts = []
@@ -92,14 +92,16 @@ def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr
         douts.append(dout.norm())
         for j in range(base, cutoff):
             param_copy = [p.clone() for p in params]
-            optim(param_copy, grads, lr * 1 / 2 ** j)
+            optim(param_copy, grads, lr * 1 / 4 ** j)
             y = loco_fwd(train_x, *param_copy, GROUPS, W1.shape[1], residual=False)
             error = (y - grad_on_output_hidden.flatten(1)).mul(1 / y.numel()).norm()
             base = j - 1
-            if (error < douts[-1]).item():
+            if (error < douts[-1] * (1 - min_improvement)).item():
                 break
         else:
             break
+        if i % 128 == 0:
+            print(torch.stack(douts[::128]).cpu().numpy().tolist(), error.item())
         params = param_copy
     for p, c in zip(params_orig, params):
         p.grad = p - c
