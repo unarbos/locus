@@ -1,5 +1,6 @@
 import copy
 import functools
+import math
 import pickle
 import time
 from typing import List
@@ -84,9 +85,11 @@ def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr
 
     douts = []
     base = 0
+    real_grads = None
     for i in range(n_steps):
         dout, grad_on_output_hidden, *grads = bwd(train_x, *params, GROUPS, grad_on_output_hidden, i == 0)
         if i == 0:
+            real_grads = grads
             params = [torch.randn_like(p) for p in params]
             continue
         douts.append(dout.norm())
@@ -100,13 +103,11 @@ def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr
                 break
         else:
             break
-        if i % 128 == 0:
-            print(torch.stack(douts[::128]).cpu().numpy().tolist(), error.item())
         params = param_copy
-    for p, c in zip(params_orig, params):
-        p.grad = p - c
+    for p, c, g in zip(params_orig, params, real_grads):
+        p.grad = g
+        p.loco_dir = c - p
     douts = torch.stack(douts).cpu().numpy()
-    print(douts[-1] / douts.max(), len(douts))
 
 
 @torch.compile(mode='max-autotune-no-cudagraphs')
@@ -218,7 +219,7 @@ class ResidualMLP(nn.Module):
         return x
 
     @torch.no_grad()
-    def loco_forward(self, train_x: Tensor, target: Tensor, target_lr: float = 1.0) -> tuple[Tensor, Tensor]:
+    def loco_forward(self, train_x: Tensor, target: Tensor, opt, target_lr: float = 1.0) -> tuple[Tensor, Tensor]:
         """
         Layer-by-layer LocoProp training.
         For each layer i:
@@ -256,6 +257,9 @@ class ResidualMLP(nn.Module):
                 grad_in, d_y = d_y, grad_in
 
             self.layers[i].loco_step(train_x, target_lr * d_y.double())
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            train_x = self.layers[i](train_x)
 
         return None, init_loss
 
@@ -277,6 +281,46 @@ class ResidualMLP(nn.Module):
             d_y = grad_storage
 
         return None, loss.detach()
+
+
+class AdamWLocoSign(torch.optim.Optimizer):
+    """AdamW magnitude (on real gradients) with locoprop direction.
+
+    `p.grad` holds the true backprop gradient — Adam's moments and per-element step
+    magnitude are computed from it as usual. `p.loco_dir = proposed - current` is the
+    locoprop-proposed update direction; we keep its element-wise sign and scale by |adam_step|.
+    """
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0):
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr, (b1, b2), eps, wd = group['lr'], group['betas'], group['eps'], group['weight_decay']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                st = self.state[p]
+                if not st:
+                    st['step'] = 0
+                    st['m'] = torch.zeros_like(p)
+                    st['v'] = torch.zeros_like(p)
+                st['step'] += 1
+                t = st['step']
+                m, v = st['m'], st['v']
+                m.mul_(b1).add_(g, alpha=1 - b1)
+                v.mul_(b2).addcmul_(g, g, value=1 - b2)
+                bc1 = 1 - b1 ** t
+                bc2_sqrt = math.sqrt(1 - b2 ** t)
+                denom = v.sqrt().div_(bc2_sqrt).add_(eps)
+                mag = m.abs().div_(denom).mul_(lr / bc1)
+                if wd != 0:
+                    p.mul_(1 - lr * wd)
+                loco_dir = getattr(p, 'loco_dir', None)
+                direction = loco_dir.sign() if loco_dir is not None else m.sign().neg_()
+                p.addcmul_(direction, mag)
 
 
 @functools.lru_cache()
@@ -319,7 +363,10 @@ def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float,
         target_lr = 1
     else:
         target_lr = None
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, fused=True, weight_decay=0.0)
+    if model.is_loco:
+        opt = AdamWLocoSign(model.parameters(), lr=lr, weight_decay=0.1)
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, fused=True, weight_decay=0.1)
     train_losses = []
 
     loss_buffer = torch.zeros((print_every,), device=device, dtype=torch.float64)
@@ -340,7 +387,7 @@ def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float,
                 _, loss = model.loco_forward_autograd(src, tgt, target_lr=target_lr)
             else:
                 with torch.no_grad():
-                    _, loss = model.loco_forward(src, tgt, target_lr=target_lr)
+                    _, loss = model.loco_forward(src, tgt, opt, target_lr=target_lr)
         else:
             y_pred = model(src)
             loss = loss_fn(y_pred, tgt)
@@ -399,7 +446,7 @@ def main(groups: int = typer.Option(16, help="Number of parallel groups"),
     # torch.manual_seed(seed + 1)
     # model = ResidualMLP(ShuffleMLPBlock, layers, groups=groups, block=block).to(device)
     # results["backprop_shuffle"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every)
-    #
+
     # sqrt_scale = 2 ** round((groups.bit_length() - 1) / 2)  # nearest pow2 to sqrt(groups)
     # hidden = sqrt_scale * block
     # print(f"\n[Backprop - Dense (hidden={hidden}, {dim / hidden:.1f}x bottleneck)]")
