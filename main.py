@@ -39,14 +39,14 @@ def loco_fwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, block, eps=1e-5):
     return out.reshape(x_s.size(0), -1) + x
 
 @torch.compile(mode='max-autotune-no-cudagraphs')
-def bwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, block, grad_on_output_hidden, compute_target, eps=1e-5):
+def bwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, grad_on_output_hidden, compute_target, eps=1e-5):
     B, D = x.shape
     x_s = shuffle(x, groups)
     mu = x_s.mean(-1, keepdim=True)
     var = x_s.var(-1, unbiased=False, keepdim=True)
     x_hat = (x_s - mu) / (var + eps).sqrt()
     x_ln = x_hat * ln_w + ln_b
-    x_r = x_ln.reshape(B, groups, block)
+    x_r = x_ln.reshape(B, groups, -1)
     h = torch.einsum('bgi,gij->bgj', x_r, W1) + b1
     mask = (h > 0).float()
     a = h * mask
@@ -79,21 +79,21 @@ def optim(params, grads, states, lr, beta, wd):
 
 
 # @torch.compile(mode='max-autotune-no-cudagraphs')
-def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr, n_steps, BATCH, BLOCK, GROUPS,
-                  EPS=1e-5, wd: float = 0.1, beta=0.9):
+def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr, n_steps, GROUPS,
+                   wd: float = 0.1, beta=0.9):
     params = ln_w, ln_b, W1, b1, W2, b2
     states = [torch.zeros_like(p) for p in params]
 
     step = torch.arange(n_steps, device=ln_w.device)
     eff_lr = torch.minimum(step + 1, n_steps - step) / ((n_steps + 1) // 2) * lr
-    # douts = []
+    douts = []
     for i, lr in enumerate(eff_lr):
-        dout, grad_on_output_hidden, *grads = bwd(train_x, *params, GROUPS, BLOCK, grad_on_output_hidden, i == 0)
+        dout, grad_on_output_hidden, *grads = bwd(train_x, *params, GROUPS, grad_on_output_hidden, i == 0)
         optim(params, grads, states, lr, beta, wd)
-    #     douts.append(dout.norm())
-    # douts = torch.stack(douts).cpu().numpy()
-    # print(douts / douts.max())
-    # assert np.argmax(douts) == 0
+        douts.append(dout.norm())
+    douts = torch.stack(douts).cpu().numpy()
+    print(douts[-1] / douts.max())
+    assert np.argmax(douts) == 0
 
 
 @torch.compile(mode='max-autotune-no-cudagraphs')
@@ -166,7 +166,7 @@ class LocoShuffleMLPBlock(ShuffleMLPBlock):
 
     def loco_step(self, train_x: Tensor, target: Tensor):
         locoprop_step(train_x, target, self.ln.weight, self.ln.bias, self.W1, self.b1, self.W2, self.b2, self.lr,
-                      self.loco_steps, BATCH=train_x.size(0), BLOCK=self.block, GROUPS=self.groups)
+                      self.loco_steps, GROUPS=self.groups)
 
     def backward_step(self, x: Tensor, grad_out: Tensor, grad_in: Tensor):
         """Fused backward: recompute forward from x, backprop grad_out -> grad_in."""
