@@ -38,6 +38,7 @@ def loco_fwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, block, eps=1e-5):
     out = torch.einsum('bgi,gij->bgj', a, W2) + b2
     return out.reshape(x_s.size(0), -1) + x
 
+
 @torch.compile(mode='max-autotune-no-cudagraphs')
 def bwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, grad_on_output_hidden, compute_target, eps=1e-5):
     B, D = x.shape
@@ -78,21 +79,30 @@ def optim(params, grads, states, lr, beta, wd):
         p -= lr * (g.sign() + p * wd)
 
 
+def split(x, groups):
+    ln0, ln1, *other = x
+    return *ln0.view(groups, -1).unbind(0), *ln1.view(groups, -1).unbind(0), *[x for o in other for x in o.unbind(0)]
+
+
 # @torch.compile(mode='max-autotune-no-cudagraphs')
-def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr, n_steps, GROUPS,
-                   wd: float = 0.1, beta=0.9):
+def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr, n_steps, GROUPS, wd: float = 0.0):
     params = ln_w, ln_b, W1, b1, W2, b2
-    states = [torch.zeros_like(p) for p in params]
+    splitp = split(params, GROUPS)  # needs to be reused, otherwise we get new id()s
+    opt = heavyball.Scion(splitp, lr=lr, weight_decay=wd)
 
     step = torch.arange(n_steps, device=ln_w.device)
     eff_lr = torch.minimum(step + 1, n_steps - step) / ((n_steps + 1) // 2) * lr
     douts = []
     for i, lr in enumerate(eff_lr):
         dout, grad_on_output_hidden, *grads = bwd(train_x, *params, GROUPS, grad_on_output_hidden, i == 0)
-        optim(params, grads, states, lr, beta, wd)
+        for p, g in zip(splitp, split(grads, GROUPS)):
+            p.grad = g
+        opt.step()
         douts.append(dout.norm())
+    opt.zero_grad(set_to_none=True)
     douts = torch.stack(douts).cpu().numpy()
     print(douts[-1] / douts.max())
+    print(douts.tolist())
     assert np.argmax(douts) == 0
 
 
@@ -292,6 +302,7 @@ class Teacher(nn.Module):
     def forward(self, x):
         return self.outproj(F.relu(self.inproj(x)))
 
+
 @torch.compile(mode='max-autotune-no-cudagraphs')
 def data(teacher, batch, dim):
     src = torch.randn((batch, dim), device=teacher.inproj.weight.device)
@@ -366,7 +377,8 @@ def run_varying_lr(lr_range, model, epochs, batch, dim, device, print_every):
 def main(groups: int = typer.Option(16, help="Number of parallel groups"),
          block: int = typer.Option(64, help="Block size per group"), batch: int = typer.Option(1024, help="Batch size"),
          layers: int = typer.Option(8, help="Number of layers"),
-         epochs: int = typer.Option(4096, help="Training epochs"), lr: float = typer.Option(0.0001, help="Learning rate"),
+         epochs: int = typer.Option(4096, help="Training epochs"),
+         lr: float = typer.Option(0.0001, help="Learning rate"),
          wd: float = typer.Option(0.0, help="Weight decay toward original weights in inner loop"),
          steps: List[int] = typer.Option([1, 16, 256], help="LocoProp steps"),
          seed: int = typer.Option(42, help="Random seed"), print_every: int = typer.Option(256, help="Print interval"),
@@ -402,11 +414,7 @@ def main(groups: int = typer.Option(16, help="Number of parallel groups"),
                             autograd_targets=False).to(device)
         results[f"loco_{s}_staged"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every)
 
-        # print(f"\n[LocoProp {s} - Autograd O(n)]")
-        # torch.manual_seed(seed + 1)
-        # model = ResidualMLP(LocoShuffleMLPBlock, layers, groups=groups, block=block, loco_steps=s, lr=lr, wd=wd,
-        #                     autograd_targets=True).to(device)
-        # results[f"loco_{s}_autograd"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every)
+        # print(f"\n[LocoProp {s} - Autograd O(n)]")  # torch.manual_seed(seed + 1)  # model = ResidualMLP(LocoShuffleMLPBlock, layers, groups=groups, block=block, loco_steps=s, lr=lr, wd=wd,  #                     autograd_targets=True).to(device)  # results[f"loco_{s}_autograd"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every)
     with open(f'results/{name}.pkl', 'wb') as f:
         pickle.dump(results, f)
 
