@@ -28,16 +28,15 @@ def unshuffle(x: Tensor, groups: int) -> Tensor:
     block = D // groups
     return x.reshape(B, groups, block).transpose(-1, -2).contiguous().reshape(B, D)
 
-
-def loco_fwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, block, eps=1e-5):
+@torch.compile(mode='max-autotune-no-cudagraphs')
+def loco_fwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, block, eps=1e-5, residual=True):
     x_s = shuffle(x, groups)
     x_s = F.layer_norm(x_s, (x.size(-1),), weight=ln_w, bias=ln_b, eps=eps)
     x_s = x_s.reshape(-1, groups, block)
     h = torch.einsum('bgi,gij->bgj', x_s, W1) + b1
     a = F.relu(h)
     out = torch.einsum('bgi,gij->bgj', a, W2) + b2
-    return out.reshape(x_s.size(0), -1) + x
-
+    return out.reshape(x_s.size(0), -1) + (x if residual else 0)
 
 @torch.compile(mode='max-autotune-no-cudagraphs')
 def bwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, grad_on_output_hidden, compute_target, eps=1e-5):
@@ -75,35 +74,36 @@ def bwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, grad_on_output_hidden, compute_ta
 @torch.compile(mode='max-autotune-no-cudagraphs')
 def optim(params, grads, states, lr, beta, wd):
     for p, g, s in zip(params, grads, states):
-        # s.lerp_(g, 1 - beta)
         p -= lr * (g.sign() + p * wd)
 
 
-def split(x, groups):
-    ln0, ln1, *other = x
-    return *ln0.view(groups, -1).unbind(0), *ln1.view(groups, -1).unbind(0), *[x for o in other for x in o.unbind(0)]
-
-
 # @torch.compile(mode='max-autotune-no-cudagraphs')
-def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr, n_steps, GROUPS, wd: float = 0.0):
+def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr, n_steps, GROUPS,
+                   wd: float = 0., beta=0.9, cutoff=20):
     params = ln_w, ln_b, W1, b1, W2, b2
-    splitp = split(params, GROUPS)  # needs to be reused, otherwise we get new id()s
-    opt = heavyball.Scion(splitp, lr=lr, weight_decay=wd)
+    states = [torch.zeros_like(p) for p in params]
 
-    step = torch.arange(n_steps, device=ln_w.device)
-    eff_lr = torch.minimum(step + 1, n_steps - step) / ((n_steps + 1) // 2) * lr
     douts = []
-    for i, lr in enumerate(eff_lr):
+    base = 0
+    for i in range(n_steps):
         dout, grad_on_output_hidden, *grads = bwd(train_x, *params, GROUPS, grad_on_output_hidden, i == 0)
-        for p, g in zip(splitp, split(grads, GROUPS)):
-            p.grad = g
-        opt.step()
         douts.append(dout.norm())
-    opt.zero_grad(set_to_none=True)
+        for j in range(base, cutoff):
+            param_copy = [p.clone() for p in params]
+            optim(param_copy, grads, states, lr * 1 / 2 ** j, beta, wd)
+            y = loco_fwd(train_x, *param_copy, GROUPS, W1.shape[1], residual=False)
+            error = (y - grad_on_output_hidden.flatten(1)).mul(1 / y.numel()).norm()
+            base = j - 1
+            if (error < douts[-1]).item():
+                break
+        else:
+            break
+        if base > cutoff:
+            break
+        for p, c in zip(params, param_copy):
+            p.copy_(c)
     douts = torch.stack(douts).cpu().numpy()
-    print(douts[-1] / douts.max())
-    print(douts.tolist())
-    assert np.argmax(douts) == 0
+    print(douts[-1] / douts.max(), len(douts))
 
 
 @torch.compile(mode='max-autotune-no-cudagraphs')
@@ -302,7 +302,6 @@ class Teacher(nn.Module):
     def forward(self, x):
         return self.outproj(F.relu(self.inproj(x)))
 
-
 @torch.compile(mode='max-autotune-no-cudagraphs')
 def data(teacher, batch, dim):
     src = torch.randn((batch, dim), device=teacher.inproj.weight.device)
@@ -375,10 +374,9 @@ def run_varying_lr(lr_range, model, epochs, batch, dim, device, print_every):
 
 @app.command()
 def main(groups: int = typer.Option(16, help="Number of parallel groups"),
-         block: int = typer.Option(64, help="Block size per group"), batch: int = typer.Option(1024, help="Batch size"),
+         block: int = typer.Option(64, help="Block size per group"), batch: int = typer.Option(16384, help="Batch size"),
          layers: int = typer.Option(8, help="Number of layers"),
-         epochs: int = typer.Option(4096, help="Training epochs"),
-         lr: float = typer.Option(0.0001, help="Learning rate"),
+         epochs: int = typer.Option(4096, help="Training epochs"), lr: float = typer.Option(0.0001, help="Learning rate"),
          wd: float = typer.Option(0.0, help="Weight decay toward original weights in inner loop"),
          steps: List[int] = typer.Option([1, 16, 256], help="LocoProp steps"),
          seed: int = typer.Option(42, help="Random seed"), print_every: int = typer.Option(256, help="Print interval"),
@@ -414,7 +412,11 @@ def main(groups: int = typer.Option(16, help="Number of parallel groups"),
                             autograd_targets=False).to(device)
         results[f"loco_{s}_staged"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every)
 
-        # print(f"\n[LocoProp {s} - Autograd O(n)]")  # torch.manual_seed(seed + 1)  # model = ResidualMLP(LocoShuffleMLPBlock, layers, groups=groups, block=block, loco_steps=s, lr=lr, wd=wd,  #                     autograd_targets=True).to(device)  # results[f"loco_{s}_autograd"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every)
+        # print(f"\n[LocoProp {s} - Autograd O(n)]")
+        # torch.manual_seed(seed + 1)
+        # model = ResidualMLP(LocoShuffleMLPBlock, layers, groups=groups, block=block, loco_steps=s, lr=lr, wd=wd,
+        #                     autograd_targets=True).to(device)
+        # results[f"loco_{s}_autograd"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every)
     with open(f'results/{name}.pkl', 'wb') as f:
         pickle.dump(results, f)
 
