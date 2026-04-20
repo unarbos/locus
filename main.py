@@ -357,8 +357,16 @@ def data(teacher, batch, dim):
     return src, tgt
 
 
+def mixup(src: Tensor, tgt: Tensor, alpha: float) -> tuple[Tensor, Tensor]:
+    if alpha <= 0:
+        return src, tgt
+    lam = torch.distributions.Beta(alpha, alpha).sample().to(src.device, src.dtype)
+    perm = torch.randperm(src.size(0), device=src.device)
+    return lam * src + (1 - lam) * src[perm], lam * tgt + (1 - lam) * tgt[perm]
+
+
 def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float, device: str, print_every: int,
-          numbers: int | None = None, loss_fn=F.mse_loss, loss_steps: int = 32):
+          numbers: int | None = None, loss_fn=F.mse_loss, loss_steps: int = 32, mixup_alpha: float = 0.0):
     if model.is_loco:
         target_lr = 1
     else:
@@ -381,6 +389,7 @@ def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float,
     for step in range(train_steps + 1):
         with torch.no_grad():
             src, tgt = data(teacher, batch, dim)
+            src, tgt = mixup(src, tgt, mixup_alpha)
 
         if model.is_loco:
             if model.autograd_targets:
@@ -417,18 +426,20 @@ def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float,
     return {"time": time.perf_counter() - start, "train_losses": np.array(train_losses)}
 
 
-def run_varying_lr(lr_range, model, epochs, batch, dim, device, print_every):
-    return {lr: train(copy.deepcopy(model), epochs, batch, dim, lr, device, print_every) for lr in lr_range}
+def run_varying_lr(lr_range, model, epochs, batch, dim, device, print_every, mixup_alpha=0.0):
+    return {lr: train(copy.deepcopy(model), epochs, batch, dim, lr, device, print_every, mixup_alpha=mixup_alpha)
+            for lr in lr_range}
 
 
 @app.command()
 def main(groups: int = typer.Option(16, help="Number of parallel groups"),
-         block: int = typer.Option(64, help="Block size per group"), batch: int = typer.Option(16384, help="Batch size"),
+         block: int = typer.Option(64, help="Block size per group"), batch: int = typer.Option(2 ** 18, help="Batch size"),
          layers: int = typer.Option(8, help="Number of layers"),
          epochs: int = typer.Option(4096, help="Training epochs"), lr: float = typer.Option(0.0001, help="Learning rate"),
          wd: float = typer.Option(0.0, help="Weight decay toward original weights in inner loop"),
          steps: List[int] = typer.Option([1, 16, 256], help="LocoProp steps"),
          seed: int = typer.Option(42, help="Random seed"), print_every: int = typer.Option(256, help="Print interval"),
+         mixup_alpha: float = typer.Option(0.0, help="Mixup Beta(a,a) param; 0 disables"),
          device: str = typer.Option("cuda", help="Device"), ):
     config = locals()
     name = ''.join(f'{k}={v}' for k, v in config.items() if isinstance(v, int))
@@ -440,7 +451,7 @@ def main(groups: int = typer.Option(16, help="Number of parallel groups"),
     print("=" * 70)
 
     results = {}
-    lrs = np.logspace(-1, -0, 2)  # 10 ** -8 to 10 ** -2
+    lrs = np.logspace(-3, -0, 2)  # 10 ** -8 to 10 ** -2
 
     # print("\n[Backprop - Shuffle]")
     # torch.manual_seed(seed + 1)
@@ -465,7 +476,7 @@ def main(groups: int = typer.Option(16, help="Number of parallel groups"),
         torch.manual_seed(seed + 1)
         model = ResidualMLP(LocoShuffleMLPBlock, layers, groups=groups, block=block, loco_steps=s, lr=lr, wd=wd,
                             autograd_targets=True).to(device)
-        results[f"loco_{s}_autograd"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every)
+        results[f"loco_{s}_autograd"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every, mixup_alpha)
     with open(f'results/{name}.pkl', 'wb') as f:
         pickle.dump(results, f)
 
