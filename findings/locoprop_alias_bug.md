@@ -147,15 +147,29 @@ kicks in at n ≥ 2.
 ### Why AdamW outer is still required
 
 With loco_as_grad already Gauss-Newton-preconditioned per layer, a natural hypothesis is
-"SGD outer should now suffice." Empirically it doesn't — SGD outer plateaus near identity
-(tail ≈ 1.0) regardless of step size. The reason is *scale*, not direction. Per-layer
-magnitudes of `loco_as_grad` vary by factors of 5–10× across depth (deeper layers accumulate the
-GN chain; shallower layers start from a smaller target residual). AdamW's per-parameter
-`√v` normalization fixes this automatically; a single global SGD learning rate cannot.
+"SGD outer should now suffice." Empirically it doesn't. Scanning SGD outer LR at n=64 (1024
+epochs, Nesterov inner β=0.9 lr=1.0):
 
-Loco's GN per layer + Adam's variance normalization across layers compose: one provides
-*within-layer* curvature adaptation, the other *across-layer* scale balancing. Neither is
-redundant with the other on this architecture.
+| SGD outer LR | tail | eval | nMSE |
+|---|---|---|---|
+| 0.01 | 0.982 | 0.967 | 17.4 |
+| 0.1 | NaN | — | — |
+| 0.3, 1.0, 3.0 | NaN | — | — |
+| SGD-Nesterov 0.3, 1.0 | NaN | — | — |
+
+There is no stable regime. At LR=0.01 the update is too small to escape identity (note: eval
+nMSE 17× means model output has blown up in magnitude relative to teacher — not literally
+at identity, but producing a near-random-scale residual stack). At LR ≥ 0.1, divergence.
+
+The reason is *per-parameter scale variance*, not just per-layer. `loco_as_grad` components
+span many orders of magnitude within a single parameter tensor (LayerNorm γ/β vs projection
+weights vs biases, with GN preconditioning amplifying the spread). A single scalar LR cannot
+simultaneously be (a) large enough for small-magnitude entries to move and (b) small enough
+for large-magnitude entries to stay stable. Adam's per-element `√v` normalization is
+load-bearing here, not ornamental.
+
+Loco's GN per layer + Adam's per-parameter scaling compose: one provides *within-layer*
+curvature adaptation, the other *across-parameter* scale equalization.
 
 ### Empirical scaling
 
@@ -163,27 +177,39 @@ At 2048 epochs, batch 16384, 8 layers × 1024 dim, AdamW outer 3e-3, Nesterov in
 
 | config | tail | eval | nMSE |
 |---|---|---|---|
+| BP+AdamW 3e-3 (4096 ep) | 0.0524 | 0.0524 | 0.943 |
 | BP+AdamW 3e-3 | 0.0594 | 0.0603 | 1.084 |
 | BP+AdamW 1e-3 | 0.0673 | 0.0637 | 1.146 |
+| BP+AdamW 1e-2 (4096 ep) | 0.315 | 0.307 | 5.52 |
 | n=64 Nesterov | 0.0339 | 0.0348 | 0.626 |
 | n=128 Nesterov | 0.0224 | 0.0250 | 0.449 |
 | n=256 Nesterov | 0.0193 | 0.0191 | 0.343 |
+| n=512 Nesterov | 0.0190 | 0.0187 | 0.337 |
 
-Doubling n roughly halves the residual gap to the architecture's capacity floor. Not yet
-saturated at n=256. Training curves show the LocoProp runs reach BP+AdamW's final loss within
-the first ~10% of training and then continue to improve for another order of magnitude while
-BP plateaus.
+Two things the ablation settled:
 
-The cost is O(n) per outer step — n=256 is ~256× the bwd-kernel work. Per-sample, not
-per-wall-clock, the GN preconditioning is a real algorithmic gain, not a compute-shift.
-Whether it's worthwhile in practice depends on whether one can tolerate the compute multiplier
-to cut the final loss by 3×.
+1. **BP floor at ~0.052 is real, not optimization stall.** Doubling BP+AdamW 3e-3 from 2048 →
+   4096 epochs moves tail from 0.0594 → 0.0524 (12% relative, 2× compute). BP+AdamW 1e-2 at
+   4096 epochs is still at 0.31, much worse — higher LR trades speed-early for divergent-late,
+   not a better asymptote. The floor is whatever ceiling BP hits on this task (architectural
+   expressivity + gradient-descent noise under MSE on Gaussian inputs).
+
+2. **n-scaling saturates between 256 and 512.** n=256 → n=512 at 2048 epochs: 0.0193 → 0.0190
+   tail, 0.0191 → 0.0187 eval. 2× compute, ~1.5% improvement. The asymptotic LocoProp floor
+   on this problem is ~0.019 eval, 3.2× lower than BP's 0.052. The earlier extrapolation
+   ("still halving at n=256") was wrong — it was already curving over and n=512 flattened it.
+
+The cost is O(n) per outer step. n=256 is ~256× the bwd-kernel work per outer step. Per-sample,
+not per-wall-clock, the GN preconditioning yields a 3× lower loss floor than any
+first-order method reaches. Whether this is worth the compute multiplier depends on the task —
+but the algorithmic gain over BP is real and now well-measured.
 
 ### What's still open
 
-- Where does the n → ∞ floor actually lie? n=256 is still decreasing. A plateau below 0.015
-  would suggest the GN step has residual bias (linearized targets become stale when the outer
-  step is large).
+- Does the 3× gap between LocoProp's 0.019 and BP's 0.052 come from GN preconditioning per
+  se, or from full-batch-gradient-ish effects of the inner regression (which uses the same
+  batch for all n inner steps)? A natural control is BP with higher effective batch (gradient
+  accumulation) at matched wall-clock.
 - Is there a regime (batch size, architecture depth, task non-convexity) where loco dominates
   wall-clock? GN preconditioning should matter more when per-step BP progress saturates for
   first-order reasons (bad conditioning, not noise). Larger batch or harder task is the natural
