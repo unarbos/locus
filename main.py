@@ -75,39 +75,25 @@ def bwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, grad_on_output_hidden, compute_ta
 @torch.compile(mode='max-autotune-no-cudagraphs')
 def optim(params, grads, lr):
     for p, g in zip(params, grads):
-        p -= lr * g.sign()
+        p -= lr * g
 
 
-# @torch.compile(mode='max-autotune-no-cudagraphs')
 def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr, n_steps, GROUPS,
-                   cutoff=5, min_improvement = 1e-5):
+                   cutoff=5, min_improvement=1e-5):
+    """Plain SGD on local regression from current params. Fixed inner lr, no line search.
+    At n=1: (p-c) = lr · ∇L_local = lr/2 · g_BP (up to factor 2 from bwd's 1/N vs mse_loss's 2/N)."""
     params_orig = params = ln_w, ln_b, W1, b1, W2, b2
-
-    douts = []
-    base = 0
     real_grads = None
+    param_copy = [p.clone() for p in params]
     for i in range(n_steps):
-        dout, grad_on_output_hidden, *grads = bwd(train_x, *params, GROUPS, grad_on_output_hidden, i == 0)
+        dout, grad_on_output_hidden, *grads = bwd(train_x, *param_copy, GROUPS, grad_on_output_hidden, i == 0)
         if i == 0:
             real_grads = grads
-            params = [torch.randn_like(p) for p in params]
-            continue
-        douts.append(dout.norm())
-        for j in range(base, cutoff):
-            param_copy = [p.clone() for p in params]
-            optim(param_copy, grads, lr * 1 / 4 ** j)
-            y = loco_fwd(train_x, *param_copy, GROUPS, W1.shape[1], residual=False)
-            error = (y - grad_on_output_hidden.flatten(1)).mul(1 / y.numel()).norm()
-            base = j - 1
-            if (error < douts[-1] * (1 - min_improvement)).item():
-                break
-        else:
-            break
-        params = param_copy
-    for p, c, g in zip(params_orig, params, real_grads):
+        optim(param_copy, grads, lr)
+    for p, c, g in zip(params_orig, param_copy, real_grads):
         p.grad = g
         p.loco_dir = c - p
-    douts = torch.stack(douts).cpu().numpy()
+        p.loco_as_grad = p - c
 
 
 @torch.compile(mode='max-autotune-no-cudagraphs')
@@ -276,9 +262,9 @@ class ResidualMLP(nn.Module):
         grad_storage = torch.empty_like(d_y)
         for layer in self.layers[::-1]:
             x = xs.pop(-1)
-            layer.backward_step(x.clone(), d_y.clone(), grad_storage)
             layer.loco_step(x.clone(), d_y.double() * target_lr)
-            d_y = grad_storage
+            layer.backward_step(x.clone(), d_y, grad_storage)
+            d_y, grad_storage = grad_storage, d_y
 
         return None, loss.detach()
 
@@ -365,22 +351,81 @@ def mixup(src: Tensor, tgt: Tensor, alpha: float) -> tuple[Tensor, Tensor]:
     return lam * src + (1 - lam) * src[perm], lam * tgt + (1 - lam) * tgt[perm]
 
 
+def _plain_block_forward(layer, x, eps=1e-5):
+    g, b = layer.groups, layer.block
+    x_s = shuffle(x, g)
+    x_s = F.layer_norm(x_s, (x.size(-1),), weight=layer.ln.weight, bias=layer.ln.bias, eps=eps)
+    x_s = x_s.reshape(-1, g, b)
+    h = torch.einsum('bgi,gij->bgj', x_s, layer.W1) + layer.b1
+    a = F.relu(h)
+    out = torch.einsum('bgi,gij->bgj', a, layer.W2) + layer.b2
+    return out.reshape(x.size(0), -1) + x
+
+
+def hutchinson_trace_grads(model, src, tgt, lam, loss_fn=F.mse_loss):
+    """Single-sample Hutchinson estimator of v^T H v with v ~ Rademacher.
+    Returns gradients of lam * (v^T H v) w.r.t. params via double-backward.
+    E[v^T H v] = tr(H), so this regularizes the Hessian trace in expectation.
+    Uses a plain (non-compiled) forward since torch.compile + aot_autograd doesn't support double-backward."""
+    base = model._orig_mod if hasattr(model, '_orig_mod') else model
+    params = [p for p in base.parameters() if p.requires_grad]
+    with torch.enable_grad():
+        y = src
+        for layer in base.layers:
+            y = _plain_block_forward(layer, y)
+        loss = loss_fn(y, tgt)
+        g = torch.autograd.grad(loss, params, create_graph=True)
+        v = [torch.empty_like(p).bernoulli_(0.5).mul_(2).sub_(1) for p in params]
+        s = sum((vi * gi).sum() for vi, gi in zip(v, g))
+        Hv = torch.autograd.grad(s, params, create_graph=True)
+        t = sum((vi * hvi).sum() for vi, hvi in zip(v, Hv))
+        return torch.autograd.grad(lam * t, params), t.detach()
+
+
 def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float, device: str, print_every: int,
-          numbers: int | None = None, loss_fn=F.mse_loss, loss_steps: int = 32, mixup_alpha: float = 0.0):
+          numbers: int | None = None, loss_fn=F.mse_loss, loss_steps: int = 32, mixup_alpha: float = 0.0,
+          hutch_lam: float = 0.0, hutch_lr: float = 1e-3, noise_std: float = 0.0, sam_rho: float = 0.0,
+          loco_opt: str = 'sign'):
     if model.is_loco:
         target_lr = 1
     else:
         target_lr = None
-    if model.is_loco:
+    if model.is_loco and loco_opt == 'sign':
         opt = AdamWLocoSign(model.parameters(), lr=lr, weight_decay=0.1)
+    elif model.is_loco and loco_opt == 'graft':
+        opt = torch.optim.SGD(model.parameters(), lr=lr)
+    elif model.is_loco and loco_opt == 'polyak':
+        opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, nesterov=True)
+    elif model.is_loco and loco_opt == 'loco_nesterov':
+        opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, nesterov=True)
+    elif model.is_loco and loco_opt == 'loco_sgd':
+        opt = torch.optim.SGD(model.parameters(), lr=lr)
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=lr, fused=True, weight_decay=0.1)
+    use_loco_grad = model.is_loco and loco_opt in ('locograd', 'loco_nesterov', 'loco_sgd')
+    use_graft = model.is_loco and loco_opt == 'graft'
+    use_polyak = model.is_loco and loco_opt == 'polyak'
     train_losses = []
 
     loss_buffer = torch.zeros((print_every,), device=device, dtype=torch.float64)
 
     teacher = Teacher(dim, dim).to(device)
     model: ResidualMLP = torch.compile(model, mode='max-autotune-no-cudagraphs')
+
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    def compute_grads(src_, tgt_):
+        if model.is_loco:
+            if model.autograd_targets:
+                _, loss_ = model.loco_forward_autograd(src_, tgt_, target_lr=target_lr)
+            else:
+                with torch.no_grad():
+                    _, loss_ = model.loco_forward(src_, tgt_, opt, target_lr=target_lr)
+        else:
+            y_pred_ = model(src_)
+            loss_ = loss_fn(y_pred_, tgt_)
+            loss_.backward()
+        return loss_
 
     start = 0
 
@@ -389,20 +434,49 @@ def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float,
     for step in range(train_steps + 1):
         with torch.no_grad():
             src, tgt = data(teacher, batch, dim)
+            if noise_std > 0:
+                src = src + noise_std * torch.randn_like(src)
             src, tgt = mixup(src, tgt, mixup_alpha)
 
-        if model.is_loco:
-            if model.autograd_targets:
-                _, loss = model.loco_forward_autograd(src, tgt, target_lr=target_lr)
-            else:
-                with torch.no_grad():
-                    _, loss = model.loco_forward(src, tgt, opt, target_lr=target_lr)
-        else:
-            y_pred = model(src)
-            loss = loss_fn(y_pred, tgt)
-            loss.backward()
+        loss = compute_grads(src, tgt)
+
+        if use_loco_grad:
+            for p in params:
+                lg = getattr(p, 'loco_as_grad', None)
+                if lg is not None:
+                    p.grad = lg
+        elif use_graft:
+            for p in params:
+                lg = getattr(p, 'loco_as_grad', None)
+                if lg is not None:
+                    p.grad = lg.sign() * (lg.norm() / lg.numel() ** 0.5)
+
+        if sam_rho > 0:
+            # Param-space SAM: ascend along current gradient, recompute at θ', restore θ, apply step using θ' direction
+            orig = [p.data.clone() for p in params]
+            with torch.no_grad():
+                gnorm_sq = sum((p.grad.pow(2).sum() for p in params if p.grad is not None), start=torch.zeros((), device=device))
+                scale = sam_rho / (gnorm_sq.sqrt() + 1e-12)
+                for p in params:
+                    if p.grad is not None:
+                        p.data.add_(p.grad, alpha=scale.item())
+                        p.grad = None
+                    if getattr(p, 'loco_dir', None) is not None:
+                        p.loco_dir = None
+            opt.zero_grad(set_to_none=True)
+            loss = compute_grads(src, tgt)
+            with torch.no_grad():
+                for p, o in zip(params, orig):
+                    p.data.copy_(o)
         opt.step()
         opt.zero_grad()
+
+        if hutch_lam > 0:
+            params = [p for p in model.parameters() if p.requires_grad]
+            hgrads, _ = hutchinson_trace_grads(model, src, tgt, hutch_lam, loss_fn)
+            with torch.no_grad():
+                for p, hg in zip(params, hgrads):
+                    p.data.sub_(hg, alpha=hutch_lr)
 
         loss_buffer[step % print_every] = loss.detach()
 
@@ -423,11 +497,13 @@ def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float,
                 best_loss = min(best_loss, avg)
 
     torch.cuda.synchronize()
-    return {"time": time.perf_counter() - start, "train_losses": np.array(train_losses)}
+    return {"time": time.perf_counter() - start, "train_losses": np.array(train_losses), "teacher": teacher}
 
 
-def run_varying_lr(lr_range, model, epochs, batch, dim, device, print_every, mixup_alpha=0.0):
-    return {lr: train(copy.deepcopy(model), epochs, batch, dim, lr, device, print_every, mixup_alpha=mixup_alpha)
+def run_varying_lr(lr_range, model, epochs, batch, dim, device, print_every, mixup_alpha=0.0,
+                   hutch_lam=0.0, hutch_lr=1e-3):
+    return {lr: train(copy.deepcopy(model), epochs, batch, dim, lr, device, print_every, mixup_alpha=mixup_alpha,
+                      hutch_lam=hutch_lam, hutch_lr=hutch_lr)
             for lr in lr_range}
 
 
@@ -440,6 +516,8 @@ def main(groups: int = typer.Option(16, help="Number of parallel groups"),
          steps: List[int] = typer.Option([1, 16, 256], help="LocoProp steps"),
          seed: int = typer.Option(42, help="Random seed"), print_every: int = typer.Option(256, help="Print interval"),
          mixup_alpha: float = typer.Option(0.0, help="Mixup Beta(a,a) param; 0 disables"),
+         hutch_lam: float = typer.Option(0.0, help="Hessian-trace penalty coeff (Hutchinson); 0 disables"),
+         hutch_lr: float = typer.Option(1e-3, help="Step size for Hutchinson penalty update"),
          device: str = typer.Option("cuda", help="Device"), ):
     config = locals()
     name = ''.join(f'{k}={v}' for k, v in config.items() if isinstance(v, int))
@@ -476,7 +554,8 @@ def main(groups: int = typer.Option(16, help="Number of parallel groups"),
         torch.manual_seed(seed + 1)
         model = ResidualMLP(LocoShuffleMLPBlock, layers, groups=groups, block=block, loco_steps=s, lr=lr, wd=wd,
                             autograd_targets=True).to(device)
-        results[f"loco_{s}_autograd"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every, mixup_alpha)
+        results[f"loco_{s}_autograd"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every, mixup_alpha,
+                                                        hutch_lam, hutch_lr)
     with open(f'results/{name}.pkl', 'wb') as f:
         pickle.dump(results, f)
 
