@@ -78,18 +78,39 @@ def optim(params, grads, lr):
         p -= lr * g
 
 
+@torch.compile(mode='max-autotune-no-cudagraphs')
+def nesterov_update(params, grads, mom, lr, beta):
+    for p, g, m in zip(params, grads, mom):
+        m.mul_(beta).sub_(g, alpha=lr)
+        p.add_(m)
+
+
+@torch.compile(mode='max-autotune-no-cudagraphs')
+def nesterov_lookahead(params, mom, beta):
+    return [p + beta * m for p, m in zip(params, mom)]
+
+
 def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr, n_steps, GROUPS,
-                   cutoff=5, min_improvement=1e-5):
-    """Plain SGD on local regression from current params. Fixed inner lr, no line search.
-    At n=1: (p-c) = lr · ∇L_local = lr/2 · g_BP (up to factor 2 from bwd's 1/N vs mse_loss's 2/N)."""
+                   beta=0.0):
+    """Inner SGD on local regression from current params. beta>0 enables Nesterov acceleration.
+    At n=1: (p-c) = lr · ∇L_local = lr/2 · g_BP (mom is zero at step 0, so Nesterov ≡ SGD there)."""
     params_orig = params = ln_w, ln_b, W1, b1, W2, b2
     real_grads = None
     param_copy = [p.clone() for p in params]
-    for i in range(n_steps):
-        dout, grad_on_output_hidden, *grads = bwd(train_x, *param_copy, GROUPS, grad_on_output_hidden, i == 0)
-        if i == 0:
-            real_grads = grads
-        optim(param_copy, grads, lr)
+    if beta > 0:
+        mom = [torch.zeros_like(p) for p in param_copy]
+        for i in range(n_steps):
+            lookahead = nesterov_lookahead(param_copy, mom, beta) if i > 0 else param_copy
+            dout, grad_on_output_hidden, *grads = bwd(train_x, *lookahead, GROUPS, grad_on_output_hidden, i == 0)
+            if i == 0:
+                real_grads = grads
+            nesterov_update(param_copy, grads, mom, lr, beta)
+    else:
+        for i in range(n_steps):
+            dout, grad_on_output_hidden, *grads = bwd(train_x, *param_copy, GROUPS, grad_on_output_hidden, i == 0)
+            if i == 0:
+                real_grads = grads
+            optim(param_copy, grads, lr)
     for p, c, g in zip(params_orig, param_copy, real_grads):
         p.grad = g
         p.loco_dir = c - p
@@ -148,9 +169,10 @@ class ShuffleMLPBlock(nn.Module):
 
 
 class LocoShuffleMLPBlock(ShuffleMLPBlock):
-    def __init__(self, groups: int, block: int, loco_steps: int, lr: float, wd: float = 0.0):
+    def __init__(self, groups: int, block: int, loco_steps: int, lr: float, wd: float = 0.0,
+                 inner_beta: float = 0.0):
         super().__init__(groups, block)
-        self.loco_steps, self.lr, self.wd = loco_steps, lr, wd
+        self.loco_steps, self.lr, self.wd, self.inner_beta = loco_steps, lr, wd, inner_beta
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -166,7 +188,7 @@ class LocoShuffleMLPBlock(ShuffleMLPBlock):
 
     def loco_step(self, train_x: Tensor, target: Tensor):
         locoprop_step(train_x, target, self.ln.weight, self.ln.bias, self.W1, self.b1, self.W2, self.b2, self.lr,
-                      self.loco_steps, GROUPS=self.groups)
+                      self.loco_steps, GROUPS=self.groups, beta=self.inner_beta)
 
     def backward_step(self, x: Tensor, grad_out: Tensor, grad_in: Tensor):
         """Fused backward: recompute forward from x, backprop grad_out -> grad_in."""

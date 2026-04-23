@@ -116,17 +116,88 @@ Re-read the `loco_step` isolation argument: `locoprop_step` clones parameters (`
 
 ## What this says about higher n
 
-With `n=1 ≡ BP` established, the question of whether n > 1 is beneficial becomes well-posed.
-At n inner steps, `c_i` approaches the argmin of the local regression — the full Gauss-Newton
-step for layer i in isolation (with fixed target). The outer update is then a GN-preconditioned
-direction per layer, not a gradient.
+With `n=1 ≡ BP` established, the question of whether n > 1 helps becomes well-posed. At n inner
+steps, `c_i` approaches the argmin of the local regression — the full Gauss-Newton step for
+layer i in isolation (with fixed target). The outer update is then a GN-preconditioned direction
+per layer, not a gradient.
 
-Empirically on this task, the gain is modest: n=16 with a well-tuned inner_lr improves tail loss
-by ~2.5% vs BP+AdamW at slow outer LR, and roughly matches at fast outer LR. The cost is O(n) per
-step. A stronger test of the theoretical benefit would (a) pair n > 1 with an outer optimizer that
-*exploits* preconditioning (not just reuses Adam moments), and (b) probe regimes where local
-over-fitting actually helps — larger batches, fewer steps, or hard optimization landscapes. This
-is unfinished work; the fix above is a prerequisite for any of it to be interpretable.
+### Why plain-SGD inner hides the benefit
+
+The local regression `½‖f_i(x_i; θ) − a_i‖²` is a quadratic-like objective with Hessian `H ≈
+J_i^T J_i`. Plain SGD on this objective converges at rate `(1 − 1/κ)^n` where κ is the condition
+number of H. For a grouped-linear-plus-ReLU-plus-LayerNorm block, κ is in the tens, meaning SGD
+takes on the order of κ steps (tens to hundreds) to actually get close to the minimum.
+
+At n=16 plain-SGD, `c_i` has moved maybe 5% of the way toward the GN solution. Most of the
+"high-n improvement" budget is being spent waiting for first-order inner convergence.
+
+**Nesterov acceleration** improves the rate to `(1 − 1/√κ)^n` — sqrt of the condition number —
+which in practice means n=16 Nesterov ≈ n=100+ plain SGD for the same local residual. The
+update rule:
+
+```
+v_{t+1} = β·v_t − lr·∇L_local(θ_t + β·v_t)
+θ_{t+1} = θ_t + v_{t+1}
+```
+
+At step 0 `v=0`, so the lookahead point equals `θ_0` and the first update is `−lr·∇L_local(θ_0)`
+— identical to plain SGD. **The n=1 ≡ BP identity is preserved for any β.** The sqrt-speedup
+kicks in at n ≥ 2.
+
+### Why AdamW outer is still required
+
+With loco_as_grad already Gauss-Newton-preconditioned per layer, a natural hypothesis is
+"SGD outer should now suffice." Empirically it doesn't — SGD outer plateaus near identity
+(tail ≈ 1.0) regardless of step size. The reason is *scale*, not direction. Per-layer
+magnitudes of `loco_as_grad` vary by factors of 5–10× across depth (deeper layers accumulate the
+GN chain; shallower layers start from a smaller target residual). AdamW's per-parameter
+`√v` normalization fixes this automatically; a single global SGD learning rate cannot.
+
+Loco's GN per layer + Adam's variance normalization across layers compose: one provides
+*within-layer* curvature adaptation, the other *across-layer* scale balancing. Neither is
+redundant with the other on this architecture.
+
+### Empirical scaling
+
+At 2048 epochs, batch 16384, 8 layers × 1024 dim, AdamW outer 3e-3, Nesterov inner β=0.9 lr=1.0:
+
+| config | tail | eval | nMSE |
+|---|---|---|---|
+| BP+AdamW 3e-3 | 0.0594 | 0.0603 | 1.084 |
+| BP+AdamW 1e-3 | 0.0673 | 0.0637 | 1.146 |
+| n=64 Nesterov | 0.0339 | 0.0348 | 0.626 |
+| n=128 Nesterov | 0.0224 | 0.0250 | 0.449 |
+| n=256 Nesterov | 0.0193 | 0.0191 | 0.343 |
+
+Doubling n roughly halves the residual gap to the architecture's capacity floor. Not yet
+saturated at n=256. Training curves show the LocoProp runs reach BP+AdamW's final loss within
+the first ~10% of training and then continue to improve for another order of magnitude while
+BP plateaus.
+
+The cost is O(n) per outer step — n=256 is ~256× the bwd-kernel work. Per-sample, not
+per-wall-clock, the GN preconditioning is a real algorithmic gain, not a compute-shift.
+Whether it's worthwhile in practice depends on whether one can tolerate the compute multiplier
+to cut the final loss by 3×.
+
+### What's still open
+
+- Where does the n → ∞ floor actually lie? n=256 is still decreasing. A plateau below 0.015
+  would suggest the GN step has residual bias (linearized targets become stale when the outer
+  step is large).
+- Is there a regime (batch size, architecture depth, task non-convexity) where loco dominates
+  wall-clock? GN preconditioning should matter more when per-step BP progress saturates for
+  first-order reasons (bad conditioning, not noise). Larger batch or harder task is the natural
+  sweep.
+- Shampoo/Muon-style inner (orthogonalized) may further reduce the inner iteration budget by
+  handling within-matrix anisotropy that Nesterov can't.
+
+## Lessons reinforced
+
+- A derivation that predicts `n=1 ≡ BP` doesn't predict `n > 1 >> BP`. The benefit is only
+  accessible once (a) the inner iteration is efficient enough to approach the argmin, and
+  (b) the outer handles the scale/variance structure that per-layer GN introduces.
+- "Higher n didn't help much" was a *symptom*, not an *algorithmic verdict*. Diagnosing it
+  required separating the inner-convergence question from the outer-scaling question.
 
 ## Lessons
 
