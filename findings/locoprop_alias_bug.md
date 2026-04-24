@@ -199,17 +199,68 @@ Two things the ablation settled:
    on this problem is ~0.019 eval, 3.2× lower than BP's 0.052. The earlier extrapolation
    ("still halving at n=256") was wrong — it was already curving over and n=512 flattened it.
 
-The cost is O(n) per outer step. n=256 is ~256× the bwd-kernel work per outer step. Per-sample,
-not per-wall-clock, the GN preconditioning yields a 3× lower loss floor than any
-first-order method reaches. Whether this is worth the compute multiplier depends on the task —
-but the algorithmic gain over BP is real and now well-measured.
+The cost is O(n) per outer step. n=256 is ~256× the bwd-kernel work per outer step.
+
+### Decomposing the gap: how much of the 3× is GN specifically?
+
+The naive comparison ("BP K=1 at 2048 epochs = 0.059 vs LocoProp n=256 = 0.019") conflates
+two things: LocoProp at n=256 does 256 bwd-passes per outer step, BP K=1 does 1. BP might
+just be under-trained. Two controls:
+
+**BP with K Adam steps per batch (same data, K updates).** At 2048 outer batches:
+
+| K | lr | tail | eval |
+|---|---|---|---|
+| 1 | 3e-3 | 0.0591 | 0.0563 |
+| 4 | 3e-3 | 0.0444 | 0.0444 |
+| 16 | 3e-3 | 0.0608 | 0.0427 |
+| 64 | 3e-3 | 0.0380 | 0.0337 |
+| 4 | 1e-3 | 0.0406 | 0.0401 |
+| 16 | 1e-3 | 0.0322 | 0.0330 |
+| 64 | 1e-3 | 0.0304 | 0.0316 |
+| 256 | 1e-3 (partial) | ~0.0296 | — |
+
+**BP K=1 with fresh data at long horizon (matched Adam-step budget).**
+
+| ep | lr | tail | eval |
+|---|---|---|---|
+| 32768 | 1e-3 | 0.0320 | 0.0320 |
+| 32768 | 3e-4 | 0.0340 | 0.0341 |
+| 131072 | 1e-3 | 0.0279 | 0.0281 |
+| 131072 | 3e-4 | 0.0283 | 0.0285 |
+
+Two observations:
+
+1. **Batch reuse is not load-bearing.** At matched Adam-step count, K=16 on 2048 batches
+   (32k Adam steps) and K=1 on 32768 batches (also 32k Adam steps) both land at ~0.032 eval.
+   What BP needs isn't more of the same batch, it's more Adam updates.
+
+2. **BP saturates near 0.028 eval at the 131k-Adam-step budget** (either K=256 reuse or
+   K=1 fresh). Doubling the Adam budget barely moves it. Call this BP's long-horizon floor.
+
+So the decomposition is:
+
+- From 0.059 (BP K=1 at 2048 ep) to 0.028 (BP at 131k Adam steps): **"BP was under-trained"**
+  — accounts for ~0.48 of the log-gap.
+- From 0.028 (BP floor) to 0.019 (LocoProp n=256): **GN-specific** — ~0.52 of log-gap,
+  or 1.5× in linear loss.
+
+The algorithmic gain from per-layer Gauss-Newton preconditioning is ~1.5×, not 3×. What looked
+like a "3× win" was partly GN and partly "well-tuned BP at long horizon is much better than
+2048-epoch BP at its default-ish LR." Both lessons matter; they are different lessons.
+
+### Wall-clock picture
+
+At matched bwd-pass count, LocoProp still wins (BP K=1 at 131k bwd = 0.028; LocoProp n=256
+at 2048 outer × 256 inner ≈ 524k bwd = 0.019). But BP's bwd pass is cheaper than LocoProp's
+inner-regression bwd (no intermediate Adam state, no autograd-target forward sweep), and the
+per-sample advantage translates to a less dramatic per-wall-clock advantage. A careful
+wall-clock comparison at matched compute hasn't been run yet.
 
 ### What's still open
 
-- Does the 3× gap between LocoProp's 0.019 and BP's 0.052 come from GN preconditioning per
-  se, or from full-batch-gradient-ish effects of the inner regression (which uses the same
-  batch for all n inner steps)? A natural control is BP with higher effective batch (gradient
-  accumulation) at matched wall-clock.
+- At matched bwd-pass budget (524k), does BP K=1 ep=524288 close further toward 0.019, or
+  does it truly plateau near 0.027? Half a day of compute to check.
 - Is there a regime (batch size, architecture depth, task non-convexity) where loco dominates
   wall-clock? GN preconditioning should matter more when per-step BP progress saturates for
   first-order reasons (bad conditioning, not noise). Larger batch or harder task is the natural
