@@ -376,7 +376,6 @@ def data(teacher, batch, dim):
 
 def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float, device: str, print_every: int,
           numbers: int | None = None, loss_fn=F.mse_loss, loss_steps: int = 32,
-          noise_std: float = 0.0, sam_rho: float = 0.0,
           loco_opt: str = 'sign', return_full_trajectory: bool = False):
     if model.is_loco:
         target_lr = 1
@@ -428,8 +427,6 @@ def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float,
     for step in range(train_steps + 1):
         with torch.no_grad():
             src, tgt = data(teacher, batch, dim)
-            if noise_std > 0:
-                src = src + noise_std * torch.randn_like(src)
 
         loss = compute_grads(src, tgt)
         if full_losses is not None:
@@ -447,25 +444,6 @@ def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float,
                 if lg is not None:
                     p.grad = lg.sign() * (lg.norm() / lg.numel() ** 0.5)
 
-        if sam_rho > 0:
-            # Param-space SAM: ascend along current gradient, recompute at θ', restore θ, apply step using θ' direction
-            orig = [p.data.clone() for p in params]
-            with torch.no_grad():
-                gnorm_sq = sum((p.grad.pow(2).sum() for p in params if p.grad is not None), start=torch.zeros((), device=device))
-                scale = sam_rho / (gnorm_sq.sqrt() + 1e-12)
-                for p in params:
-                    if p.grad is not None:
-                        p.data.add_(p.grad, alpha=scale.item())
-                        p.grad = None
-                    if getattr(p, 'loco_dir', None) is not None:
-                        p.loco_dir = None
-            opt.zero_grad(set_to_none=True)
-            loss = compute_grads(src, tgt)
-            if full_losses is not None:
-                full_losses[step] = loss.detach()
-            with torch.no_grad():
-                for p, o in zip(params, orig):
-                    p.data.copy_(o)
         opt.step()
         opt.zero_grad()
 
