@@ -1,15 +1,12 @@
 import copy
-import functools
 import math
 import pickle
 import time
-from typing import List
 
 import heavyball
 import numpy as np
 import torch
 import typer
-from sympy import prevprime
 from torch import Tensor
 from torch import nn
 from torch.nn import functional as F
@@ -27,20 +24,15 @@ def shuffle(x: Tensor, groups: int) -> Tensor:
     return x.reshape(B, block, groups).transpose(-1, -2).contiguous().reshape(B, D)
 
 
-def unshuffle(x: Tensor, groups: int) -> Tensor:
-    B, D = x.shape
-    block = D // groups
-    return x.reshape(B, groups, block).transpose(-1, -2).contiguous().reshape(B, D)
-
 @torch.compile(mode='max-autotune-no-cudagraphs')
-def loco_fwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, block, eps=1e-5, residual=True):
+def loco_fwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, block, eps=1e-5):
     x_s = shuffle(x, groups)
     x_s = F.layer_norm(x_s, (x.size(-1),), weight=ln_w, bias=ln_b, eps=eps)
     x_s = x_s.reshape(-1, groups, block)
     h = torch.einsum('bgi,gij->bgj', x_s, W1) + b1
     a = F.relu(h)
     out = torch.einsum('bgi,gij->bgj', a, W2) + b2
-    return out.reshape(x_s.size(0), -1) + (x if residual else 0)
+    return out.reshape(x_s.size(0), -1) + x
 
 def _bwd_core(x, ln_w, ln_b, W1, b1, W2, b2, groups, grad_on_output_hidden, compute_target, eps=1e-5):
     B, D = x.shape
@@ -51,7 +43,7 @@ def _bwd_core(x, ln_w, ln_b, W1, b1, W2, b2, groups, grad_on_output_hidden, comp
     x_ln = x_hat * ln_w + ln_b
     x_r = x_ln.reshape(B, groups, -1)
     h = torch.einsum('bgi,gij->bgj', x_r, W1) + b1
-    mask = (h > 0).float()
+    mask = h > 0
     a = h * mask
     y = torch.einsum('bgi,gij->bgj', a, W2) + b2
     if compute_target:
@@ -71,10 +63,7 @@ def _bwd_core(x, ln_w, ln_b, W1, b1, W2, b2, groups, grad_on_output_hidden, comp
     dln_b = dx_ln.sum(0)
     dln_w = (dx_ln * x_hat).sum(0)
 
-    return dout, target, dln_w, dln_b, dW1, db1, dW2, db2
-
-
-bwd = torch.compile(_bwd_core, mode='max-autotune-no-cudagraphs')
+    return target, dln_w, dln_b, dW1, db1, dW2, db2
 
 
 INNER_CHUNK = 64
@@ -82,13 +71,12 @@ INNER_CHUNK = 64
 
 @torch.compile(mode='max-autotune-no-cudagraphs', dynamic=False)
 def _inner_sgd_first(train_x, target, ln_w, ln_b, W1, b1, W2, b2, lr, groups, K):
-    p = (ln_w.clone(), ln_b.clone(), W1.clone(), b1.clone(), W2.clone(), b2.clone())
-    real_grads = None
-    for i in range(K):
-        _, target, *grads = _bwd_core(train_x, *p, groups, target, i == 0)
-        grads = tuple(grads)
-        if i == 0:
-            real_grads = grads
+    p = tuple(t.clone() for t in (ln_w, ln_b, W1, b1, W2, b2))
+    target, *real_grads = _bwd_core(train_x, *p, groups, target, True)
+    real_grads = tuple(real_grads)
+    p = tuple(pj - lr * g for pj, g in zip(p, real_grads))
+    for _ in range(K - 1):
+        _, *grads = _bwd_core(train_x, *p, groups, target, False)
         p = tuple(pj - lr * g for pj, g in zip(p, grads))
     return p, target, real_grads
 
@@ -97,22 +85,21 @@ def _inner_sgd_first(train_x, target, ln_w, ln_b, W1, b1, W2, b2, lr, groups, K)
 def _inner_sgd_continue(train_x, target, ln_w, ln_b, W1, b1, W2, b2, lr, groups, K):
     p = (ln_w, ln_b, W1, b1, W2, b2)
     for _ in range(K):
-        _, _, *grads = _bwd_core(train_x, *p, groups, target, False)
+        _, *grads = _bwd_core(train_x, *p, groups, target, False)
         p = tuple(pj - lr * g for pj, g in zip(p, grads))
     return p
 
 
 @torch.compile(mode='max-autotune-no-cudagraphs', dynamic=False)
 def _inner_nesterov_first(train_x, target, ln_w, ln_b, W1, b1, W2, b2, lr, beta, groups, K):
-    p = (ln_w.clone(), ln_b.clone(), W1.clone(), b1.clone(), W2.clone(), b2.clone())
-    mom = tuple(torch.zeros_like(x) for x in p)
-    real_grads = None
-    for i in range(K):
-        la = tuple(pj + beta * mj for pj, mj in zip(p, mom)) if i > 0 else p
-        _, target, *grads = _bwd_core(train_x, *la, groups, target, i == 0)
-        grads = tuple(grads)
-        if i == 0:
-            real_grads = grads
+    p = tuple(t.clone() for t in (ln_w, ln_b, W1, b1, W2, b2))
+    target, *real_grads = _bwd_core(train_x, *p, groups, target, True)
+    real_grads = tuple(real_grads)
+    mom = tuple(-lr * g for g in real_grads)
+    p = tuple(pj + mj for pj, mj in zip(p, mom))
+    for _ in range(K - 1):
+        la = tuple(pj + beta * mj for pj, mj in zip(p, mom))
+        _, *grads = _bwd_core(train_x, *la, groups, target, False)
         mom = tuple(beta * mj - lr * g for mj, g in zip(mom, grads))
         p = tuple(pj + mj for pj, mj in zip(p, mom))
     return p, mom, target, real_grads
@@ -125,7 +112,7 @@ def _inner_nesterov_continue(train_x, target, ln_w, ln_b, W1, b1, W2, b2,
     mom = (mln_w, mln_b, mW1, mb1, mW2, mb2)
     for _ in range(K):
         la = tuple(pj + beta * mj for pj, mj in zip(p, mom))
-        _, _, *grads = _bwd_core(train_x, *la, groups, target, False)
+        _, *grads = _bwd_core(train_x, *la, groups, target, False)
         mom = tuple(beta * mj - lr * g for mj, g in zip(mom, grads))
         p = tuple(pj + mj for pj, mj in zip(p, mom))
     return p, mom
@@ -158,8 +145,7 @@ def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr
             remaining -= K2
     for p, c, g in zip(params_orig, param_copy, real_grads):
         p.grad = g
-        p.loco_dir = c - p
-        p.loco_as_grad = p - c
+        p.loco_grad = p - c
 
 
 @torch.compile(mode='max-autotune-no-cudagraphs')
@@ -219,18 +205,6 @@ class LocoShuffleMLPBlock(ShuffleMLPBlock):
         super().__init__(groups, block)
         self.loco_steps, self.lr, self.wd, self.inner_beta = loco_steps, lr, wd, inner_beta
 
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Forward pass using fused Triton kernel.
-        Computes y = f(x) + x where f is LayerNorm + MLP.
-        """
-        y = torch.empty_like(x)
-        self.forward_step(x, y)
-        return y
-
-    def forward_step(self, x: Tensor, output_tensor: Tensor):
-        output_tensor.copy_(super().forward(x))
-
     def loco_step(self, train_x: Tensor, target: Tensor):
         locoprop_step(train_x, target, self.ln.weight, self.ln.bias, self.W1, self.b1, self.W2, self.b2, self.lr,
                       self.loco_steps, GROUPS=self.groups, beta=self.inner_beta)
@@ -268,80 +242,55 @@ class ResidualMLP(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         for layer in self.layers:
-            x = layer(x)  # layer.forward() includes residual
+            x = layer(x)
         return x
 
     @torch.no_grad()
-    def loco_forward(self, train_x: Tensor, target: Tensor, opt, target_lr: float = 1.0) -> tuple[Tensor, Tensor]:
-        """
-        Layer-by-layer LocoProp training.
-        For each layer i:
-          1. Forward through layers i to end to get final prediction
-          2. Compute gradient at layer i output via backprop
-          3. Set target = current_output - target_lr * gradient (move towards lower loss)
-          4. Run loco_step which trains layer i weights and updates train_x in-place
-
-        Returns:
-            (train_x, init_loss): train_x is the final output, init_loss is the
-                                  loss from the first forward pass (before training).
-        """
-        train_x = train_x.clone()
+    def loco_forward(self, train_x: Tensor, target: Tensor, opt, target_lr: float = 1.0) -> Tensor:
+        """Staged O(n²) LocoProp: for each layer i, forward to end, backprop to layer i, take a step."""
         depth = len(self.layers)
         init_loss = None
-
         for i in range(depth):
-            y_i = y = self.layers[i](train_x)
+            y = self.layers[i](train_x)
             xs = []
             for j in range(i + 1, depth):
                 xs.append(y)
-                new = torch.empty_like(y)
-                self.layers[j].forward_step(y, new)
-                y = new
-
+                y = self.layers[j](y)
             d_y = y - target
-
-            # Compute initial loss before any training
             if i == 0:
-                init_loss = (d_y ** 2).mean()
-
+                init_loss = d_y.square().mean()
             grad_in = torch.empty_like(d_y)
             for j in range(depth - 1, i, -1):
-                self.layers[j].backward_step(xs.pop(-1), d_y, grad_in)
+                self.layers[j].backward_step(xs.pop(), d_y, grad_in)
                 grad_in, d_y = d_y, grad_in
-
             self.layers[i].loco_step(train_x, target_lr * d_y.double())
             opt.step()
             opt.zero_grad(set_to_none=True)
             train_x = self.layers[i](train_x)
-
-        return None, init_loss
+        return init_loss
 
     @torch.no_grad()
-    def loco_forward_autograd(self, train_x: Tensor, target: Tensor, target_lr: float = 1.0) -> tuple[Tensor, Tensor]:
-        """O(n) baseline: single autograd backward to get all targets, then local optimization."""
-        x = train_x.clone().requires_grad_(True)
+    def loco_forward_autograd(self, train_x: Tensor, target: Tensor, target_lr: float = 1.0) -> Tensor:
+        """O(n) baseline: single backward sweep to get per-layer targets, then local optimization."""
+        x = train_x
         ys = [x := layer(x) for layer in self.layers]
-
         d_y = x - target
         loss = d_y.square().mean()
 
-        xs = [train_x.detach()] + ys[:-1]
         grad_storage = torch.empty_like(d_y)
-        for layer in self.layers[::-1]:
-            x = xs.pop(-1).detach()
-            layer.loco_step(x, d_y.double() * target_lr)
-            layer.backward_step(x, d_y, grad_storage)
+        for inp, layer in zip(reversed([train_x] + ys[:-1]), reversed(self.layers)):
+            layer.loco_step(inp, d_y.double() * target_lr)
+            layer.backward_step(inp, d_y, grad_storage)
             d_y, grad_storage = grad_storage, d_y
-
-        return None, loss.detach()
+        return loss
 
 
 class AdamWLocoSign(torch.optim.Optimizer):
     """AdamW magnitude (on real gradients) with locoprop direction.
 
     `p.grad` holds the true backprop gradient — Adam's moments and per-element step
-    magnitude are computed from it as usual. `p.loco_dir = proposed - current` is the
-    locoprop-proposed update direction; we keep its element-wise sign and scale by |adam_step|.
+    magnitude are computed from it as usual. `p.loco_grad = current - proposed` is the
+    gradient-aligned locoprop update; we descend along its negated sign with |adam_step|.
     """
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0):
@@ -371,26 +320,9 @@ class AdamWLocoSign(torch.optim.Optimizer):
                 mag = m.abs().div_(denom).mul_(lr / bc1)
                 if wd != 0:
                     p.mul_(1 - lr * wd)
-                loco_dir = getattr(p, 'loco_dir', None)
-                direction = loco_dir.sign() if loco_dir is not None else m.sign().neg_()
+                lg = getattr(p, 'loco_grad', None)
+                direction = lg.sign().neg_() if lg is not None else m.sign().neg_()
                 p.addcmul_(direction, mag)
-
-
-@functools.lru_cache()
-def cached_prevprime(n):
-    return prevprime(n)
-
-
-@torch.compile(mode='max-autotune-no-cudagraphs', fullgraph=True)
-def solve_loss(template: Tensor, fn, steps: int):  # SGD without momentum finds the optimum very fast and consistently
-    yp = torch.zeros_like(template)
-    for i in range(steps):
-        loss, vjp_fn = torch.func.vjp(fn, yp)
-        d_yp, = vjp_fn(torch.ones_like(loss))
-
-        lr = min(i + 1, steps - i) / steps
-        yp -= d_yp * lr
-    return yp.detach()
 
 
 class Teacher(nn.Module):
@@ -411,7 +343,6 @@ def data(teacher, batch, dim):
 
 
 def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float, device: str, print_every: int,
-          numbers: int | None = None, loss_fn=F.mse_loss, loss_steps: int = 32,
           loco_opt: str = 'sign', return_full_trajectory: bool = False, weight_decay: float = 0.1):
     target_lr = 1 if model.is_loco else None
     if model.is_loco and loco_opt == 'sign':
@@ -440,14 +371,12 @@ def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float,
     def compute_grads(src_, tgt_):
         if model.is_loco:
             if model.autograd_targets:
-                _, loss_ = model.loco_forward_autograd(src_, tgt_, target_lr=target_lr)
-            else:
-                with torch.no_grad():
-                    _, loss_ = model.loco_forward(src_, tgt_, opt, target_lr=target_lr)
-        else:
-            y_pred_ = model(src_)
-            loss_ = loss_fn(y_pred_, tgt_)
-            loss_.backward()
+                return model.loco_forward_autograd(src_, tgt_, target_lr=target_lr)
+            with torch.no_grad():
+                return model.loco_forward(src_, tgt_, opt, target_lr=target_lr)
+        y_pred_ = model(src_)
+        loss_ = F.mse_loss(y_pred_, tgt_)
+        loss_.backward()
         return loss_
 
     # Untimed warmup: trigger compile, discard gradients so model state is unchanged.
@@ -468,12 +397,12 @@ def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float,
             last_recorded = step
         if use_loco_grad:
             for p in params:
-                lg = getattr(p, 'loco_as_grad', None)
+                lg = getattr(p, 'loco_grad', None)
                 if lg is not None:
                     p.grad = lg
         elif use_graft:
             for p in params:
-                lg = getattr(p, 'loco_as_grad', None)
+                lg = getattr(p, 'loco_grad', None)
                 if lg is not None:
                     p.grad = lg.sign() * (lg.norm() / lg.numel() ** 0.5)
         opt.step()
@@ -507,7 +436,7 @@ def main(groups: int = typer.Option(16, help="Number of parallel groups"),
          layers: int = typer.Option(8, help="Number of layers"),
          epochs: int = typer.Option(4096, help="Training epochs"), lr: float = typer.Option(0.0001, help="Learning rate"),
          wd: float = typer.Option(0.0, help="Weight decay toward original weights in inner loop"),
-         steps: List[int] = typer.Option([1, 16, 256], help="LocoProp steps"),
+         steps: list[int] = typer.Option([1, 16, 256], help="LocoProp steps"),
          seed: int = typer.Option(42, help="Random seed"), print_every: int = typer.Option(256, help="Print interval"),
          device: str = typer.Option("cuda", help="Device"), ):
     config = locals()
