@@ -1,10 +1,4 @@
-"""Build, compute, and plot the LocoProp scaling ladder.
-
-Reads sweep jsonl(s), extracts (n, B, lr) -> loss, and produces:
-  1. ladder envelope: per-n best loss across (B, lr), as a function of n and as a function of compute
-  2. Pareto: loss vs compute (bwd-passes) colored by n
-  3. heatmap: loss(B, lr) per n
-"""
+"""LocoProp scaling-ladder plots from per-run npz."""
 import argparse
 import json
 from pathlib import Path
@@ -13,29 +7,40 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+def iter_npz(paths):
+    for p in paths:
+        p = Path(p)
+        if p.is_dir():
+            files = sorted((p / "runs").glob("*.npz")) if (p / "runs").exists() else sorted(p.glob("*.npz"))
+            yield from files
+        elif p.suffix == ".npz":
+            yield p
+
+
 def load_runs(paths):
     rows = []
-    for p in paths:
-        for line in Path(p).read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            d = json.loads(line)
-            if d.get("kind") != "run" or str(d.get("status", "")).startswith("error"):
-                continue
-            c = d["config"]; s = d.get("summary") or {}
-            ev = d.get("eval") or {}
-            best = s.get("best"); tail = s.get("tail_mean")
-            if best is None or tail is None or not np.isfinite(best) or not np.isfinite(tail):
-                continue
-            rows.append(dict(
-                n=c["inner_steps"], B=c["batch_size"], lr=c["outer_lr"],
-                epochs=c["epochs"], best=best, tail=tail,
-                eval=ev.get("nmse"),
-                bwd=c["epochs"] * (c["inner_steps"] + 1) * c["batch_size"],
-                samples=c["epochs"] * c["batch_size"],
-                status=d.get("status"),
-            ))
+    for f in iter_npz(paths):
+        d = np.load(f, allow_pickle=False)
+        meta = json.loads(str(d["meta"]))
+        if str(meta.get("status", "")).startswith("error"):
+            continue
+        c = meta["config"]; s = meta.get("summary") or {}
+        ev = meta.get("eval") or {}
+        best = s.get("best"); tail = s.get("tail_mean")
+        if best is None or tail is None or not np.isfinite(best) or not np.isfinite(tail):
+            continue
+        block_kind = c.get("block_kind", "loco")
+        per_step = (3 * c["inner_steps"] + 2) if block_kind == "loco" else 3  # fwd-pass units
+        rows.append(dict(
+            block_kind=block_kind,
+            n=c["inner_steps"], B=c["batch_size"], lr=c["outer_lr"], wd=c.get("weight_decay", 0.0),
+            epochs=c["epochs"], best=best, tail=tail,
+            eval=ev.get("nmse"),
+            bwd=c["epochs"] * per_step * c["batch_size"],
+            samples=c["epochs"] * c["batch_size"],
+            status=meta.get("status"),
+            losses=np.asarray(d["losses"], dtype=np.float64),
+        ))
     return rows
 
 
@@ -63,7 +68,6 @@ def plot_ladder(rows, out_path, key="best"):
     rows = [r for r in rows if r[key] is not None and np.isfinite(r[key])]
     ns = sorted({r["n"] for r in rows})
     Bs = sorted({r["B"] for r in rows})
-    lrs = sorted({r["lr"] for r in rows})
     cmap_n = plt.get_cmap("viridis")
     cmap_b = plt.get_cmap("plasma")
     color_n = {n: cmap_n(i / max(1, len(ns) - 1)) for i, n in enumerate(ns)}
@@ -71,7 +75,6 @@ def plot_ladder(rows, out_path, key="best"):
 
     fig, axes = plt.subplots(2, 2, figsize=(15, 11))
 
-    # --- (0,0) n-ladder: loss vs n, one line per B (lr-optimal), envelope ---
     ax = axes[0, 0]
     nb = best_by(rows, ("n", "B"), key)
     for B in Bs:
@@ -87,7 +90,6 @@ def plot_ladder(rows, out_path, key="best"):
     ax.set_title("n-ladder (lr-optimal at each (n, B))")
     ax.grid(True, which="both", alpha=0.3); ax.legend(fontsize=8, ncol=2)
 
-    # --- (0,1) B-ladder: loss vs B, one line per n (lr-optimal), envelope ---
     ax = axes[0, 1]
     for n in ns:
         xy = sorted([(B, r[key]) for (nn, B), r in nb.items() if nn == n])
@@ -102,7 +104,6 @@ def plot_ladder(rows, out_path, key="best"):
     ax.set_title("B-ladder (lr-optimal at each (n, B))")
     ax.grid(True, which="both", alpha=0.3); ax.legend(fontsize=8, ncol=2)
 
-    # --- (1,0) interaction heatmap: n × B, lr-optimal best loss ---
     ax = axes[1, 0]
     grid = np.full((len(ns), len(Bs)), np.nan)
     lr_grid = np.full((len(ns), len(Bs)), np.nan)
@@ -124,7 +125,6 @@ def plot_ladder(rows, out_path, key="best"):
                         fontsize=6.5, color=tc)
     plt.colorbar(im, ax=ax, label=f"log10({key})")
 
-    # --- (1,1) Pareto: loss vs compute, scatter colored by n ---
     ax = axes[1, 1]
     for n in ns:
         sub = [r for r in rows if r["n"] == n]
@@ -132,7 +132,7 @@ def plot_ladder(rows, out_path, key="best"):
                    color=color_n[n], s=18, alpha=0.55, label=f"n={n}")
     px, py = pareto_lower([r["bwd"] for r in rows], [r[key] for r in rows])
     ax.loglog(px, py, "k-", lw=2, label="Pareto")
-    ax.set_xlabel("compute = epochs * (n+1) * B  (bwd-pass-samples)")
+    ax.set_xlabel("compute = epochs * B * (3n+2 loco | 3 bp)  (fwd-pass-samples)")
     ax.set_ylabel(f"{key} loss")
     ax.set_title("Pareto: loss vs compute")
     ax.grid(True, which="both", alpha=0.3); ax.legend(ncol=2, fontsize=7, loc="lower left")
@@ -174,7 +174,7 @@ def print_table(rows, key="best"):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("paths", nargs="*", default=["findings/locoprop_scaling_full.jsonl"])
+    ap.add_argument("paths", nargs="+", help="sweep dirs (containing runs/*.npz) or *.npz files")
     ap.add_argument("--key", default="best", choices=["best", "tail", "eval"])
     ap.add_argument("--out", default="findings/scaling_ladder.png")
     args = ap.parse_args()

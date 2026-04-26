@@ -42,8 +42,7 @@ def loco_fwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, block, eps=1e-5, residual=Tr
     out = torch.einsum('bgi,gij->bgj', a, W2) + b2
     return out.reshape(x_s.size(0), -1) + (x if residual else 0)
 
-@torch.compile(mode='max-autotune-no-cudagraphs')
-def bwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, grad_on_output_hidden, compute_target, eps=1e-5):
+def _bwd_core(x, ln_w, ln_b, W1, b1, W2, b2, groups, grad_on_output_hidden, compute_target, eps=1e-5):
     B, D = x.shape
     x_s = shuffle(x, groups)
     mu = x_s.mean(-1, keepdim=True)
@@ -75,51 +74,88 @@ def bwd(x, ln_w, ln_b, W1, b1, W2, b2, groups, grad_on_output_hidden, compute_ta
     return dout, target, dln_w, dln_b, dW1, db1, dW2, db2
 
 
-@torch.compile(mode='max-autotune-no-cudagraphs')
-def optim(params, grads, lr):
-    for p, g in zip(params, grads):
-        p -= lr * g
+bwd = torch.compile(_bwd_core, mode='max-autotune-no-cudagraphs')
 
 
-@torch.compile(mode='max-autotune-no-cudagraphs')
-def nesterov_update(params, grads, mom, lr, beta):
-    for p, g, m in zip(params, grads, mom):
-        m.mul_(beta).sub_(g, alpha=lr)
-        p.add_(m)
+INNER_CHUNK = 64
 
 
-@torch.compile(mode='max-autotune-no-cudagraphs')
-def nesterov_lookahead(out, params, mom, beta):
-    for o, p, m in zip(out, params, mom):
-        torch.add(p, m, alpha=beta, out=o)
+@torch.compile(mode='max-autotune-no-cudagraphs', dynamic=False)
+def _inner_sgd_first(train_x, target, ln_w, ln_b, W1, b1, W2, b2, lr, groups, K):
+    p = (ln_w.clone(), ln_b.clone(), W1.clone(), b1.clone(), W2.clone(), b2.clone())
+    real_grads = None
+    for i in range(K):
+        _, target, *grads = _bwd_core(train_x, *p, groups, target, i == 0)
+        grads = tuple(grads)
+        if i == 0:
+            real_grads = grads
+        p = tuple(pj - lr * g for pj, g in zip(p, grads))
+    return p, target, real_grads
+
+
+@torch.compile(mode='max-autotune-no-cudagraphs', dynamic=False)
+def _inner_sgd_continue(train_x, target, ln_w, ln_b, W1, b1, W2, b2, lr, groups, K):
+    p = (ln_w, ln_b, W1, b1, W2, b2)
+    for _ in range(K):
+        _, _, *grads = _bwd_core(train_x, *p, groups, target, False)
+        p = tuple(pj - lr * g for pj, g in zip(p, grads))
+    return p
+
+
+@torch.compile(mode='max-autotune-no-cudagraphs', dynamic=False)
+def _inner_nesterov_first(train_x, target, ln_w, ln_b, W1, b1, W2, b2, lr, beta, groups, K):
+    p = (ln_w.clone(), ln_b.clone(), W1.clone(), b1.clone(), W2.clone(), b2.clone())
+    mom = tuple(torch.zeros_like(x) for x in p)
+    real_grads = None
+    for i in range(K):
+        la = tuple(pj + beta * mj for pj, mj in zip(p, mom)) if i > 0 else p
+        _, target, *grads = _bwd_core(train_x, *la, groups, target, i == 0)
+        grads = tuple(grads)
+        if i == 0:
+            real_grads = grads
+        mom = tuple(beta * mj - lr * g for mj, g in zip(mom, grads))
+        p = tuple(pj + mj for pj, mj in zip(p, mom))
+    return p, mom, target, real_grads
+
+
+@torch.compile(mode='max-autotune-no-cudagraphs', dynamic=False)
+def _inner_nesterov_continue(train_x, target, ln_w, ln_b, W1, b1, W2, b2,
+                              mln_w, mln_b, mW1, mb1, mW2, mb2, lr, beta, groups, K):
+    p = (ln_w, ln_b, W1, b1, W2, b2)
+    mom = (mln_w, mln_b, mW1, mb1, mW2, mb2)
+    for _ in range(K):
+        la = tuple(pj + beta * mj for pj, mj in zip(p, mom))
+        _, _, *grads = _bwd_core(train_x, *la, groups, target, False)
+        mom = tuple(beta * mj - lr * g for mj, g in zip(mom, grads))
+        p = tuple(pj + mj for pj, mj in zip(p, mom))
+    return p, mom
 
 
 def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr, n_steps, GROUPS,
                    beta=0.0):
-    """Inner SGD on local regression from current params. beta>0 enables Nesterov acceleration.
-    At n=1: (p-c) = lr · ∇L_local = lr/2 · g_BP (mom is zero at step 0, so Nesterov ≡ SGD there)."""
-    params_orig = params = ln_w, ln_b, W1, b1, W2, b2
-    real_grads = None
-    param_copy = [p.clone() for p in params]
+    """Chunked-unrolled inner SGD/Nesterov. INNER_CHUNK caps unroll size so compile time
+    is bounded; large n is run as multiple chunks. n=1 ≡ BP equivalence preserved (real_grads
+    comes from iteration 0 of the first chunk, bit-identical to a single bwd call)."""
+    params_orig = (ln_w, ln_b, W1, b1, W2, b2)
+    K = min(n_steps, INNER_CHUNK)
     if beta > 0:
-        mom = [torch.zeros_like(p) for p in param_copy]
-        lookahead = [torch.empty_like(p) for p in param_copy]
-        for i in range(n_steps):
-            if i > 0:
-                nesterov_lookahead(lookahead, param_copy, mom, beta)
-                la = lookahead
-            else:
-                la = param_copy
-            dout, grad_on_output_hidden, *grads = bwd(train_x, *la, GROUPS, grad_on_output_hidden, i == 0)
-            if i == 0:
-                real_grads = grads
-            nesterov_update(param_copy, grads, mom, lr, beta)
+        param_copy, mom, target, real_grads = _inner_nesterov_first(
+            train_x, grad_on_output_hidden, *params_orig, lr, beta, GROUPS, K)
+        remaining = n_steps - K
+        while remaining > 0:
+            K2 = min(remaining, INNER_CHUNK)
+            param_copy, mom = _inner_nesterov_continue(
+                train_x, target, *param_copy, *mom, lr, beta, GROUPS, K2)
+            remaining -= K2
     else:
-        for i in range(n_steps):
-            dout, grad_on_output_hidden, *grads = bwd(train_x, *param_copy, GROUPS, grad_on_output_hidden, i == 0)
-            if i == 0:
-                real_grads = grads
-            optim(param_copy, grads, lr)
+        param_copy, target, real_grads = _inner_sgd_first(
+            train_x, grad_on_output_hidden, *params_orig, lr, GROUPS, K)
+        remaining = n_steps - K
+        while remaining > 0:
+            K2 = min(remaining, INNER_CHUNK)
+            param_copy = _inner_sgd_continue(
+                train_x, target, *param_copy, lr, GROUPS, K2)
+            remaining -= K2
     for p, c, g in zip(params_orig, param_copy, real_grads):
         p.grad = g
         p.loco_dir = c - p
@@ -376,35 +412,29 @@ def data(teacher, batch, dim):
 
 def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float, device: str, print_every: int,
           numbers: int | None = None, loss_fn=F.mse_loss, loss_steps: int = 32,
-          loco_opt: str = 'sign', return_full_trajectory: bool = False):
-    if model.is_loco:
-        target_lr = 1
-    else:
-        target_lr = None
+          loco_opt: str = 'sign', return_full_trajectory: bool = False, weight_decay: float = 0.1):
+    target_lr = 1 if model.is_loco else None
     if model.is_loco and loco_opt == 'sign':
-        opt = AdamWLocoSign(model.parameters(), lr=lr, weight_decay=0.1)
+        opt = AdamWLocoSign(model.parameters(), lr=lr, weight_decay=weight_decay)
     elif model.is_loco and loco_opt == 'graft':
-        opt = torch.optim.SGD(model.parameters(), lr=lr)
+        opt = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
     elif model.is_loco and loco_opt == 'polyak':
-        opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, nesterov=True)
+        opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, nesterov=True, weight_decay=weight_decay)
     elif model.is_loco and loco_opt == 'loco_nesterov':
-        opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, nesterov=True)
+        opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, nesterov=True, weight_decay=weight_decay)
     elif model.is_loco and loco_opt == 'loco_sgd':
-        opt = torch.optim.SGD(model.parameters(), lr=lr)
+        opt = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
     else:
-        opt = torch.optim.AdamW(model.parameters(), lr=lr, fused=True, weight_decay=0.1)
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, fused=True, weight_decay=weight_decay)
     use_loco_grad = model.is_loco and loco_opt in ('locograd', 'loco_nesterov', 'loco_sgd')
     use_graft = model.is_loco and loco_opt == 'graft'
-    use_polyak = model.is_loco and loco_opt == 'polyak'
     train_losses = []
-    full_losses = torch.empty((train_steps + 1,), device=device, dtype=torch.float64) if return_full_trajectory else None
+    full_losses = torch.empty((train_steps,), device=device, dtype=torch.float64) if return_full_trajectory else None
     last_recorded = -1
-
     loss_buffer = torch.zeros((print_every,), device=device, dtype=torch.float64)
 
     teacher = Teacher(dim, dim).to(device)
     model: ResidualMLP = torch.compile(model, mode='max-autotune-no-cudagraphs')
-
     params = [p for p in model.parameters() if p.requires_grad]
 
     def compute_grads(src_, tgt_):
@@ -420,19 +450,22 @@ def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float,
             loss_.backward()
         return loss_
 
-    start = 0
+    # Untimed warmup: trigger compile, discard gradients so model state is unchanged.
+    with torch.no_grad():
+        src, tgt = data(teacher, batch, dim)
+    compute_grads(src, tgt)
+    opt.zero_grad(set_to_none=True)
+    torch.cuda.synchronize()
+    start = time.perf_counter()
 
     best_loss = float('inf')
-
-    for step in range(train_steps + 1):
+    for step in range(train_steps):
         with torch.no_grad():
             src, tgt = data(teacher, batch, dim)
-
         loss = compute_grads(src, tgt)
         if full_losses is not None:
             full_losses[step] = loss.detach()
             last_recorded = step
-
         if use_loco_grad:
             for p in params:
                 lg = getattr(p, 'loco_as_grad', None)
@@ -443,23 +476,14 @@ def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float,
                 lg = getattr(p, 'loco_as_grad', None)
                 if lg is not None:
                     p.grad = lg.sign() * (lg.norm() / lg.numel() ** 0.5)
-
         opt.step()
         opt.zero_grad()
-
         loss_buffer[step % print_every] = loss.detach()
-
-        if step == 0:
-            torch.cuda.synchronize()
-            start = time.perf_counter()
-            continue
-
-        step += 1  # we have now done the step and should log the first datapoint as 1st not 0th -> 10/20 not 9/19
-        if step % print_every == 0:
+        if (step + 1) % print_every == 0:
             with torch.no_grad():
                 buf = loss_buffer.cpu()
                 avg = buf.log().mean().exp().item()
-                print(f"  {step:5d} | train {avg:.6f}")
+                print(f"  {step + 1:5d} | train {avg:.6f}")
                 train_losses.extend(buf.tolist())
                 if not np.isfinite(avg) or avg > 2 * best_loss:
                     break
