@@ -54,12 +54,12 @@ def _bwd_core(x, ln_w, ln_b, W1, b1, W2, b2, groups, grad_on_output_hidden, comp
 
     db2 = dout.sum(0)
     dW2 = torch.einsum('bgi,bgj->gij', a, dout)
-    da = torch.einsum('bgj,gji->bgi', dout, W2.transpose(-1, -2))
+    da = torch.einsum('bgj,gij->bgi', dout, W2)
     dh = da * mask
     db1 = dh.sum(0)
     dW1 = torch.einsum('bgi,bgj->gij', x_r, dh)
 
-    dx_ln = torch.einsum('bgj,gji->bgi', dh, W1.transpose(-1, -2)).reshape(B, D)
+    dx_ln = torch.einsum('bgj,gij->bgi', dh, W1).reshape(B, D)
     dln_b = dx_ln.sum(0)
     dln_w = (dx_ln * x_hat).sum(0)
 
@@ -151,33 +151,21 @@ def locoprop_step(train_x, grad_on_output_hidden, ln_w, ln_b, W1, b1, W2, b2, lr
 @torch.compile(mode='max-autotune-no-cudagraphs')
 def locoprop_backward(x, grad_out, grad_in, ln_w, ln_b, W1, b1, W2, b2, BLOCK, GROUPS, EPS=1e-5):
     B, C = x.shape
-
-    # recompute forward
     x_s = shuffle(x, GROUPS)
     mu = x_s.mean(-1, keepdim=True)
-    var = x_s.var(-1, unbiased=False, keepdim=True)
-    sigma = (var + EPS).sqrt()
+    sigma = (x_s.var(-1, unbiased=False, keepdim=True) + EPS).sqrt()
     x_hat = (x_s - mu) / sigma
     ln_out = (x_hat * ln_w + ln_b).reshape(B, GROUPS, BLOCK)
-    h = torch.einsum('bgi,gij->bgj', ln_out, W1) + b1
-    mask = h > 0
+    mask = (torch.einsum('bgi,gij->bgj', ln_out, W1) + b1) > 0
 
-    # backward through W2
     d_out = grad_out.reshape(B, GROUPS, -1)
-    da = torch.einsum('bgj,gij->bgi', d_out, W2)
-
-    # backward through relu + W1
-    dh = da * mask
+    dh = torch.einsum('bgj,gij->bgi', d_out, W2) * mask
     d_ln = torch.einsum('bgj,gij->bgi', dh, W1).reshape(B, C)
 
-    # backward through layer norm
     dx_hat = d_ln * ln_w
-    dx_s = (1.0 / (C * sigma)) * (
-            C * dx_hat - dx_hat.sum(-1, keepdim=True) - x_hat * (dx_hat * x_hat).sum(-1, keepdim=True))
-
-    # backward through shuffle (inverse permutation)
-    dx = shuffle(dx_s, C // GROUPS)
-    grad_in.copy_(dx + grad_out)  # residual
+    dx_s = (C * dx_hat - dx_hat.sum(-1, keepdim=True)
+            - x_hat * (dx_hat * x_hat).sum(-1, keepdim=True)) / (C * sigma)
+    grad_in.copy_(shuffle(dx_s, C // GROUPS) + grad_out)
 
 
 class ShuffleMLPBlock(nn.Module):
@@ -337,9 +325,7 @@ class Teacher(nn.Module):
 @torch.compile(mode='max-autotune-no-cudagraphs')
 def data(teacher, batch, dim):
     src = torch.randn((batch, dim), device=teacher.inproj.weight.device)
-    tgt = teacher(src).detach()
-    src = src.detach()
-    return src, tgt
+    return src, teacher(src)
 
 
 def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float, device: str, print_every: int,
@@ -347,13 +333,9 @@ def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float,
     target_lr = 1 if model.is_loco else None
     if model.is_loco and loco_opt == 'sign':
         opt = AdamWLocoSign(model.parameters(), lr=lr, weight_decay=weight_decay)
-    elif model.is_loco and loco_opt == 'graft':
-        opt = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
-    elif model.is_loco and loco_opt == 'polyak':
+    elif model.is_loco and loco_opt in ('polyak', 'loco_nesterov'):
         opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, nesterov=True, weight_decay=weight_decay)
-    elif model.is_loco and loco_opt == 'loco_nesterov':
-        opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, nesterov=True, weight_decay=weight_decay)
-    elif model.is_loco and loco_opt == 'loco_sgd':
+    elif model.is_loco and loco_opt in ('graft', 'loco_sgd'):
         opt = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=lr, fused=True, weight_decay=weight_decay)
@@ -379,10 +361,14 @@ def train(model: ResidualMLP, train_steps: int, batch: int, dim: int, lr: float,
         loss_.backward()
         return loss_
 
-    # Untimed warmup: trigger compile, discard gradients so model state is unchanged.
+    # Untimed warmup: trigger compile of inner kernels. Always use autograd path
+    # (same compiled kernels as staged) since it leaves model state untouched.
     with torch.no_grad():
         src, tgt = data(teacher, batch, dim)
-    compute_grads(src, tgt)
+    if model.is_loco:
+        model.loco_forward_autograd(src, tgt, target_lr=target_lr)
+    else:
+        F.mse_loss(model(src), tgt).backward()
     opt.zero_grad(set_to_none=True)
     torch.cuda.synchronize()
     start = time.perf_counter()
