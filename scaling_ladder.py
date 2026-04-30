@@ -31,13 +31,13 @@ def load_runs(paths):
             continue
         block_kind = c.get("block_kind", "loco")
         per_step = (3 * c["inner_steps"] + 2) if block_kind == "loco" else 3  # fwd-pass units
+        steps_run = s.get("recorded_steps") or c["epochs"]
         rows.append(dict(
             block_kind=block_kind,
             n=c["inner_steps"], B=c["batch_size"], lr=c["outer_lr"], wd=c.get("weight_decay", 0.0),
             epochs=c["epochs"], best=best, tail=tail,
             eval=ev.get("nmse"),
-            bwd=c["epochs"] * per_step * c["batch_size"],
-            samples=c["epochs"] * c["batch_size"],
+            bwd=steps_run * per_step * c["batch_size"],
             status=meta.get("status"),
             losses=np.asarray(d["losses"], dtype=np.float64),
         ))
@@ -64,6 +64,10 @@ def pareto_lower(xs, ys):
     return xs[keep], ys[keep]
 
 
+def n_label(n):
+    return "BP" if n == 1 else f"loco n={n}"
+
+
 def plot_ladder(rows, out_path, key="best"):
     rows = [r for r in rows if r[key] is not None and np.isfinite(r[key])]
     ns = sorted({r["n"] for r in rows})
@@ -86,7 +90,7 @@ def plot_ladder(rows, out_path, key="best"):
     xs = sorted(env_n)
     ys = [env_n[n][key] for n in xs]
     ax.loglog(xs, ys, "k-", lw=2.2, ms=8, marker="o", label="envelope")
-    ax.set_xlabel("inner steps n"); ax.set_ylabel(f"{key} loss")
+    ax.set_xlabel("inner steps n  (n=1 column is BP)"); ax.set_ylabel(f"{key} loss")
     ax.set_title("n-ladder (lr-optimal at each (n, B))")
     ax.grid(True, which="both", alpha=0.3); ax.legend(fontsize=8, ncol=2)
 
@@ -95,7 +99,7 @@ def plot_ladder(rows, out_path, key="best"):
         xy = sorted([(B, r[key]) for (nn, B), r in nb.items() if nn == n])
         if xy:
             xs, ys = zip(*xy)
-            ax.loglog(xs, ys, "o-", color=color_n[n], ms=4, lw=1, alpha=0.7, label=f"n={n}")
+            ax.loglog(xs, ys, "o-", color=color_n[n], ms=4, lw=1, alpha=0.7, label=n_label(n))
     env_b = best_by(rows, "B", key)
     xs = sorted(env_b)
     ys = [env_b[B][key] for B in xs]
@@ -112,8 +116,8 @@ def plot_ladder(rows, out_path, key="best"):
         lr_grid[ns.index(n), Bs.index(B)] = r["lr"]
     im = ax.imshow(np.log10(grid), aspect="auto", origin="lower", cmap="viridis_r")
     ax.set_xticks(range(len(Bs))); ax.set_xticklabels(Bs)
-    ax.set_yticks(range(len(ns))); ax.set_yticklabels(ns)
-    ax.set_xlabel("batch B"); ax.set_ylabel("inner steps n")
+    ax.set_yticks(range(len(ns))); ax.set_yticklabels([n_label(n) for n in ns])
+    ax.set_xlabel("batch B"); ax.set_ylabel("method")
     ax.set_title(f"interaction: log10({key}) over (n, B)  [lr-optimal per cell, lr printed]")
     med = np.nanmedian(np.log10(grid))
     for i in range(len(ns)):
@@ -129,10 +133,10 @@ def plot_ladder(rows, out_path, key="best"):
     for n in ns:
         sub = [r for r in rows if r["n"] == n]
         ax.scatter([r["bwd"] for r in sub], [r[key] for r in sub],
-                   color=color_n[n], s=18, alpha=0.55, label=f"n={n}")
+                   color=color_n[n], s=18, alpha=0.55, label=n_label(n))
     px, py = pareto_lower([r["bwd"] for r in rows], [r[key] for r in rows])
     ax.loglog(px, py, "k-", lw=2, label="Pareto")
-    ax.set_xlabel("compute = epochs * B * (3n+2 loco | 3 bp)  (fwd-pass-samples)")
+    ax.set_xlabel("compute = steps * B * (3n+2 loco | 3 bp)  (fwd-pass-samples)")
     ax.set_ylabel(f"{key} loss")
     ax.set_title("Pareto: loss vs compute")
     ax.grid(True, which="both", alpha=0.3); ax.legend(ncol=2, fontsize=7, loc="lower left")
