@@ -279,10 +279,23 @@ class AdamWLocoSign(torch.optim.Optimizer):
     `p.grad` holds the true backprop gradient — Adam's moments and per-element step
     magnitude are computed from it as usual. `p.loco_grad = current - proposed` is the
     gradient-aligned locoprop update; we descend along its negated sign with |adam_step|.
+
+    Calibration knobs (matter at scale, mostly harmless on small toys):
+      `eps`         default 1e-6 (was 1e-8). For bf16 params with `state_fp32=False`,
+                    1e-8 is below `v.sqrt()` precision when grads are small, and the
+                    `mag = |m| / (sqrt(v) + eps)` ratio explodes on those elements.
+                    1e-6 is the standard transformers/HF default for bf16 training.
+      `state_fp32`  default True. Keeps `m, v` in fp32 even when params are bf16.
+                    The bf16 `addcmul_(g, g)` for `v` rounds away contributions when
+                    the existing `v` is much larger than `(1-β2)g²`, so `v` stalls at
+                    a stale value and `mag` drifts. fp32 state costs 2× param memory
+                    (~64GB extra at 8B); usually worth it.
     """
 
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-6, weight_decay=0.0,
+                 state_fp32=True):
         super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
+        self._state_fp32 = state_fp32
 
     @torch.no_grad()
     def step(self):
@@ -295,13 +308,15 @@ class AdamWLocoSign(torch.optim.Optimizer):
                 st = self.state[p]
                 if not st:
                     st['step'] = 0
-                    st['m'] = torch.zeros_like(p)
-                    st['v'] = torch.zeros_like(p)
+                    state_dtype = torch.float32 if self._state_fp32 else p.dtype
+                    st['m'] = torch.zeros_like(p, dtype=state_dtype)
+                    st['v'] = torch.zeros_like(p, dtype=state_dtype)
                 st['step'] += 1
                 t = st['step']
                 m, v = st['m'], st['v']
-                m.mul_(b1).add_(g, alpha=1 - b1)
-                v.mul_(b2).addcmul_(g, g, value=1 - b2)
+                gf = g.float() if m.dtype == torch.float32 and g.dtype != torch.float32 else g
+                m.mul_(b1).add_(gf, alpha=1 - b1)
+                v.mul_(b2).addcmul_(gf, gf, value=1 - b2)
                 bc1 = 1 - b1 ** t
                 bc2_sqrt = math.sqrt(1 - b2 ** t)
                 denom = v.sqrt().div_(bc2_sqrt).add_(eps)
@@ -310,7 +325,7 @@ class AdamWLocoSign(torch.optim.Optimizer):
                     p.mul_(1 - lr * wd)
                 lg = getattr(p, 'loco_grad', None)
                 direction = lg.sign().neg_() if lg is not None else m.sign().neg_()
-                p.addcmul_(direction, mag)
+                p.addcmul_(direction.to(p.dtype), mag.to(p.dtype))
 
 
 class Teacher(nn.Module):
@@ -435,27 +450,9 @@ def main(groups: int = typer.Option(16, help="Number of parallel groups"),
     print("=" * 70)
 
     results = {}
-    lrs = np.logspace(-3, -0, 2)  # 10 ** -8 to 10 ** -2
-
-    # print("\n[Backprop - Shuffle]")
-    # torch.manual_seed(seed + 1)
-    # model = ResidualMLP(ShuffleMLPBlock, layers, groups=groups, block=block).to(device)
-    # results["backprop_shuffle"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every)
-
-    # sqrt_scale = 2 ** round((groups.bit_length() - 1) / 2)  # nearest pow2 to sqrt(groups)
-    # hidden = sqrt_scale * block
-    # print(f"\n[Backprop - Dense (hidden={hidden}, {dim / hidden:.1f}x bottleneck)]")
-    # torch.manual_seed(seed + 1)
-    # model = ResidualMLP(DenseMLPBlock, layers, dim=dim, hidden=hidden).to(device)
-    # results["backprop_dense"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every)
+    lrs = np.logspace(-3, -0, 2)
 
     for s in steps:
-        # print(f"\n[LocoProp {s} - Staged O(n²)]")
-        # torch.manual_seed(seed + 1)
-        # model = ResidualMLP(LocoShuffleMLPBlock, layers, groups=groups, block=block, loco_steps=s, lr=lr, wd=wd,
-        #                     autograd_targets=False).to(device)
-        # results[f"loco_{s}_staged"] = run_varying_lr(lrs, model, epochs, batch, dim, device, print_every)
-
         print(f"\n[LocoProp {s} - Autograd O(n)]")
         torch.manual_seed(seed + 1)
         model = ResidualMLP(LocoShuffleMLPBlock, layers, groups=groups, block=block, loco_steps=s, lr=lr, wd=wd,
