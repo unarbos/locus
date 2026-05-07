@@ -42,16 +42,16 @@ def run(lr, loco_lr, k, batch, n_steps, staged=None, seed=42):
 
 def tune(batch, k, n_trials, n_steps, log_path):
     has_loco = k > 0
-    space = {'lr': optuna.distributions.FloatDistribution(1e-5, 1e-1, log=True)}
+    space = {'lr': optuna.distributions.FloatDistribution(1e-6, 1, log=True)}
     if has_loco:
-        space['loco_lr'] = optuna.distributions.FloatDistribution(1e-7, 1e-1, log=True)
+        space['loco_lr'] = optuna.distributions.FloatDistribution(1e-6, 1, log=True)
 
     sampler = HEBOSampler(search_space=space, seed=0)
     study = optuna.create_study(sampler=sampler, direction='minimize')
 
     def obj(trial):
-        lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
-        loco_lr = trial.suggest_float('loco_lr', 1e-7, 1e-1, log=True) if has_loco else 0.0
+        lr = trial.suggest_float('lr', 1e-6, 1, log=True)
+        loco_lr = trial.suggest_float('loco_lr', 1e-6, 1, log=True) if has_loco else 0.0
         v, dt = run(lr, loco_lr, k, batch, n_steps)
         with open(log_path, 'a') as f:
             f.write(f"trial b={batch} k={k} lr={lr:.4e} loco_lr={loco_lr:.4e} val={v:.4f} t={dt:.1f}s\n")

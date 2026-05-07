@@ -36,6 +36,38 @@ def rms_norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
+INNER_CHUNK = 64
+
+
+@torch.compile(mode='max-autotune-no-cudagraphs', dynamic=False)
+def _inner_sgd_first(x, go, W1, W2, lr, n, K):
+    target = F.relu(x @ W1.T).pow(2) @ W2 - go
+    W1k = W1.clone()
+    W2k = W2.clone()
+    for _ in range(K):
+        pre = x @ W1k.T
+        relu = pre.relu()
+        post = relu.pow(2)
+        dout = (post @ W2k - target) / n
+        dpre = (dout @ W2k.T) * 2 * relu
+        W1k = W1k - lr * (dpre.T @ x)
+        W2k = W2k - lr * (post.T @ dout)
+    return W1k, W2k, target
+
+
+@torch.compile(mode='max-autotune-no-cudagraphs', dynamic=False)
+def _inner_sgd_continue(x, target, W1k, W2k, lr, n, K):
+    for _ in range(K):
+        pre = x @ W1k.T
+        relu = pre.relu()
+        post = relu.pow(2)
+        dout = (post @ W2k - target) / n
+        dpre = (dout @ W2k.T) * 2 * relu
+        W1k = W1k - lr * (dpre.T @ x)
+        W2k = W2k - lr * (post.T @ dout)
+    return W1k, W2k
+
+
 class Attention(nn.Module):
     def __init__(self):
         super().__init__()
@@ -59,7 +91,7 @@ class LocoMLP(nn.Module):
         super().__init__()
         b = 0.5 * DIM ** -0.5 * 3 ** 0.5
         self.c_fc = nn.Parameter(torch.empty(HDIM, DIM).uniform_(-b, b))
-        self.c_proj = nn.Parameter(torch.zeros(HDIM, DIM))
+        self.c_proj = nn.Parameter(torch.empty(HDIM, DIM).normal_(std=0.02 / N_LAYERS ** 0.5))
         self._x = None
         self._g = None
 
@@ -67,9 +99,10 @@ class LocoMLP(nn.Module):
         xn = rms_norm(x)
         h = xn @ self.c_fc.T
         y = F.relu(h).pow(2) @ self.c_proj
+        self._x = None
+        self._g = None
         if self.training and LOCO_STEPS > 0:
             self._x = xn.detach()
-            self._g = None
             y.register_hook(self._cap)
         return y
 
@@ -84,25 +117,15 @@ class LocoMLP(nn.Module):
         go = self._g.reshape(-1, DIM)
         n = float(go.numel())
         W1, W2 = self.c_fc, self.c_proj
-        target = F.relu(x @ W1.T).pow(2) @ W2 - go
-        W1k = W1.clone()
-        W2k = W2.clone()
-        acc1 = torch.zeros_like(W1)
-        acc2 = torch.zeros_like(W2)
-        for _ in range(LOCO_STEPS):
-            pre = x @ W1k.T
-            relu = pre.relu()
-            post = relu.pow(2)
-            dout = (post @ W2k - target) / n
-            dpre = (dout @ W2k.T) * 2 * relu
-            u1 = LOCO_LR * (dpre.T @ x)
-            u2 = LOCO_LR * (post.T @ dout)
-            W1k -= u1
-            W2k -= u2
-            acc1 += u1
-            acc2 += u2
-        W1.loco_grad = acc1
-        W2.loco_grad = acc2
+        K = min(LOCO_STEPS, INNER_CHUNK)
+        W1k, W2k, target = _inner_sgd_first(x, go, W1, W2, LOCO_LR, n, K)
+        remaining = LOCO_STEPS - K
+        while remaining > 0:
+            K2 = min(remaining, INNER_CHUNK)
+            W1k, W2k = _inner_sgd_continue(x, target, W1k, W2k, LOCO_LR, n, K2)
+            remaining -= K2
+        W1.loco_grad = W1 - W1k
+        W2.loco_grad = W2 - W2k
         self._x = None
         self._g = None
 
@@ -131,18 +154,17 @@ class GPT(nn.Module):
 
 
 class AdamWLoco(torch.optim.Optimizer):
-    def __init__(self, params, lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.01, sign=True):
+    def __init__(self, params, lr, betas=(0.9, 0.95), eps=1e-6, weight_decay=0.01):
         super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
-        self.sign = sign
 
     @torch.no_grad()
     def step(self):
         for grp in self.param_groups:
             lr, (b1, b2), eps, wd = grp['lr'], grp['betas'], grp['eps'], grp['weight_decay']
             for p in grp['params']:
-                if p.grad is None and getattr(p, 'loco_grad', None) is None:
+                if p.grad is None:
                     continue
-                g = p.grad.float() if p.grad is not None else torch.zeros_like(p, dtype=torch.float32)
+                g = p.grad.float()
                 st = self.state[p]
                 if not st:
                     st['step'] = 0
@@ -156,24 +178,14 @@ class AdamWLoco(torch.optim.Optimizer):
                 bc1 = 1 - b1 ** t
                 bc2 = math.sqrt(1 - b2 ** t)
                 denom = v.sqrt().div_(bc2).add_(eps)
-                if self.sign:
-                    mag = m.abs().div_(denom).mul_(lr / bc1)
-                    if wd != 0:
-                        p.mul_(1 - lr * wd)
-                    lg = getattr(p, 'loco_grad', None)
-                    direction = lg.sign().neg_() if lg is not None else m.sign().neg_()
-                    p.addcmul_(direction.to(p.dtype), mag.to(p.dtype))
-                    if lg is not None:
-                        p.loco_grad = None
-                else:
-                    lg = getattr(p, 'loco_grad', None)
-                    src = lg.float() if lg is not None else m
-                    update = src.div(denom).mul(lr / bc1)
-                    if wd != 0:
-                        update.add_(p, alpha=lr * wd)
-                    p.sub_(update.to(p.dtype))
-                    if lg is not None:
-                        p.loco_grad = None
+                mag = m.abs().div_(denom).mul_(lr / bc1)
+                if wd != 0:
+                    p.mul_(1 - lr * wd)
+                lg = getattr(p, 'loco_grad', None)
+                direction = lg.sign().neg_() if lg is not None else m.sign().neg_()
+                p.addcmul_(direction.to(p.dtype), mag.to(p.dtype))
+                if lg is not None:
+                    p.loco_grad = None
 
 
 def load_shard(path):
@@ -204,8 +216,7 @@ def main():
     for p in model.parameters():
         if world_size > 1:
             dist.broadcast(p, 0)
-    opt = AdamWLoco(model.parameters(), lr=LR, weight_decay=WD,
-                    sign=int(os.environ.get('SIGN', '1')))
+    opt = AdamWLoco(model.parameters(), lr=LR, weight_decay=WD)
 
     data = Path(os.environ.get('DATA_PATH', 'data/fineweb10B'))
     train_shards = sorted(data.glob('fineweb_train_*.bin'))
@@ -217,15 +228,9 @@ def main():
     if master:
         print(f"loco_steps={LOCO_STEPS} loco_lr={LOCO_LR} lr={LR} batch_seq={BATCH_SEQ} seq_len={SEQ_LEN}", flush=True)
 
-    staged = int(os.environ.get('STAGED', '0'))
-    block_params = []
-    for i in range(N_LAYERS):
-        bp = set(model.attns[i].parameters()) | set(model.mlps[i].parameters())
-        block_params.append(bp)
-    shared_params = set(model.parameters())
-    for bp in block_params:
-        shared_params -= bp
-
+    # FedAvg semantics: per-rank n in inner SGD + AVG-reduce of loco_grad averages
+    # local solver outputs, not data-parallel solver on the global batch. K=1 is
+    # equivalent to data-parallel; K>1 diverges from a single-GPU run on the same tokens.
     def reduce_grads():
         if world_size <= 1:
             return
@@ -242,27 +247,11 @@ def main():
         x, y = next(train_it)
         loss = model(x, y)
         loss.backward()
-        if LOCO_STEPS > 0 and staged:
-            saved = {p: (p.grad.detach().clone() if p.grad is not None else None)
-                     for p in model.parameters()}
-            for i in range(N_LAYERS):
-                for p in model.parameters():
-                    p.grad = (saved[p].clone() if (p in block_params[i] and saved[p] is not None) else None)
-                model.mlps[i].loco_step()
-                reduce_grads()
-                opt.step()
-                opt.zero_grad(set_to_none=True)
-            for p in model.parameters():
-                p.grad = (saved[p].clone() if (p in shared_params and saved[p] is not None) else None)
-            reduce_grads()
-            opt.step()
-            opt.zero_grad(set_to_none=True)
-        else:
-            if LOCO_STEPS > 0:
-                model.loco_step()
-            reduce_grads()
-            opt.step()
-            opt.zero_grad(set_to_none=True)
+        if LOCO_STEPS > 0:
+            model.loco_step()
+        reduce_grads()
+        opt.step()
+        opt.zero_grad(set_to_none=True)
         l = loss.detach().clone()
         if world_size > 1:
             dist.all_reduce(l, op=dist.ReduceOp.AVG)
