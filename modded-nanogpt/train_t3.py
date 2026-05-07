@@ -30,6 +30,7 @@ WD = float(os.environ.get('WD', '0.01'))
 N_STEPS = int(os.environ.get('N_STEPS', '20'))
 LOCO_STEPS = int(os.environ.get('LOCO_STEPS', '0'))
 LOCO_LR = float(os.environ.get('LOCO_LR', '0.0001'))
+GRAD_CKPT = int(os.environ.get('GRAD_CKPT', '0'))
 
 
 def rms_norm(x):
@@ -140,11 +141,18 @@ class GPT(nn.Module):
         nn.init.normal_(self.embed.weight, std=0.02)
         nn.init.normal_(self.lm_head, std=0.02)
 
+    def _block(self, x, attn, mlp):
+        x = x + attn(x)
+        x = x + mlp(x)
+        return x
+
     def forward(self, tokens, targets):
         x = self.embed(tokens)
         for attn, mlp in zip(self.attns, self.mlps):
-            x = x + attn(x)
-            x = x + mlp(x)
+            if GRAD_CKPT and self.training:
+                x = torch.utils.checkpoint.checkpoint(self._block, x, attn, mlp, use_reentrant=False)
+            else:
+                x = self._block(x, attn, mlp)
         logits = rms_norm(x) @ self.lm_head.T
         return F.cross_entropy(logits.view(-1, VOCAB).float(), targets.view(-1))
 
