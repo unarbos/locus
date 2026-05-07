@@ -154,8 +154,17 @@ class GPT(nn.Module):
 
 
 class AdamWLoco(torch.optim.Optimizer):
-    def __init__(self, params, lr, betas=(0.9, 0.95), eps=1e-6, weight_decay=0.01):
+    """AdamW with optional sign on the descent direction.
+
+    sign=True (empirical winner, but theoretically off): direction = -sign(loco_grad),
+        magnitude = |m|/denom * lr/bc1. For non-loco params, direction = -sign(m), which
+        coincides with standard AdamW (sign(m)*|m| = m).
+    sign=False (true AdamW-on-loco-direction): direction × magnitude = -loco_grad/denom * lr/bc1.
+        BP-grad-derived per-coordinate scale × loco-grad direction. Non-loco params reduce
+        to standard AdamW (-m/denom * lr/bc1)."""
+    def __init__(self, params, lr, betas=(0.9, 0.95), eps=1e-6, weight_decay=0.01, sign=True):
         super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
+        self.sign = sign
 
     @torch.no_grad()
     def step(self):
@@ -178,12 +187,39 @@ class AdamWLoco(torch.optim.Optimizer):
                 bc1 = 1 - b1 ** t
                 bc2 = math.sqrt(1 - b2 ** t)
                 denom = v.sqrt().div_(bc2).add_(eps)
-                mag = m.abs().div_(denom).mul_(lr / bc1)
+                lg = getattr(p, 'loco_grad', None)
+                src = lg if lg is not None else m
                 if wd != 0:
                     p.mul_(1 - lr * wd)
+                if self.sign:
+                    mag = m.abs().div_(denom).mul_(lr / bc1)
+                    p.addcmul_(src.sign().neg_().to(p.dtype), mag.to(p.dtype))
+                else:
+                    update = src.div(denom).mul_(lr / bc1)
+                    p.sub_(update.to(p.dtype))
+                if lg is not None:
+                    p.loco_grad = None
+
+
+class LocoSGD(torch.optim.Optimizer):
+    """Pure-locoprop SGD outer: p ← p*(1 - lr*wd) - lr * (loco_grad if set else p.grad).
+    With lr=1, wd=0: loco params land at W_K (inner SGD's proposed destination), non-loco
+    params take a plain SGD step on BP grad. K=0 reduces to plain SGD across the model."""
+    def __init__(self, params, lr, weight_decay=0.0):
+        super().__init__(params, dict(lr=lr, weight_decay=weight_decay))
+
+    @torch.no_grad()
+    def step(self):
+        for grp in self.param_groups:
+            lr, wd = grp['lr'], grp['weight_decay']
+            for p in grp['params']:
                 lg = getattr(p, 'loco_grad', None)
-                direction = lg.sign().neg_() if lg is not None else m.sign().neg_()
-                p.addcmul_(direction.to(p.dtype), mag.to(p.dtype))
+                g = lg if lg is not None else p.grad
+                if g is None:
+                    continue
+                if wd != 0:
+                    p.mul_(1 - lr * wd)
+                p.sub_(g.to(p.dtype), alpha=lr)
                 if lg is not None:
                     p.loco_grad = None
 
@@ -216,7 +252,15 @@ def main():
     for p in model.parameters():
         if world_size > 1:
             dist.broadcast(p, 0)
-    opt = AdamWLoco(model.parameters(), lr=LR, weight_decay=WD)
+    outer = os.environ.get('OUTER_OPT', 'sign')
+    if outer == 'sign':
+        opt = AdamWLoco(model.parameters(), lr=LR, weight_decay=WD, sign=True)
+    elif outer == 'adamw':
+        opt = AdamWLoco(model.parameters(), lr=LR, weight_decay=WD, sign=False)
+    elif outer == 'pure':
+        opt = LocoSGD(model.parameters(), lr=LR, weight_decay=WD)
+    else:
+        raise ValueError(f"OUTER_OPT={outer!r}; expected 'sign', 'adamw', or 'pure'")
 
     data = Path(os.environ.get('DATA_PATH', 'data/fineweb10B'))
     train_shards = sorted(data.glob('fineweb_train_*.bin'))
@@ -226,7 +270,7 @@ def main():
     val_it = loader(val_shards, BATCH_SEQ, SEQ_LEN)
 
     if master:
-        print(f"loco_steps={LOCO_STEPS} loco_lr={LOCO_LR} lr={LR} batch_seq={BATCH_SEQ} seq_len={SEQ_LEN}", flush=True)
+        print(f"outer={outer} loco_steps={LOCO_STEPS} loco_lr={LOCO_LR} lr={LR} batch_seq={BATCH_SEQ} seq_len={SEQ_LEN}", flush=True)
 
     # FedAvg semantics: per-rank n in inner SGD + AVG-reduce of loco_grad averages
     # local solver outputs, not data-parallel solver on the global batch. K=1 is
