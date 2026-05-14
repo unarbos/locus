@@ -148,6 +148,76 @@ ValidatorNeuronConfig(
 The validator rejects manifests or receipts whose signatures do not verify.
 Production subnet mode should bind these checks to Bittensor wallet signatures.
 
+## Artifact Crypto Policies
+
+Every `ArtifactRef` can carry an optional `ArtifactCryptoPolicy`. If no policy
+is set, bytes are stored exactly as before.
+
+Signed output:
+
+```python
+from locus_core.protocol import ArtifactCryptoPolicy, ArtifactRef, CryptoMode
+
+delta = ArtifactRef(
+    name="delta",
+    uri=delta_uri,
+    crypto=ArtifactCryptoPolicy(
+        mode=CryptoMode.SIGNED.value,
+        required_signer="assigned_hotkey",
+    ),
+)
+```
+
+Encrypted output in dev mode:
+
+```python
+private_update = ArtifactRef(
+    name="private_update",
+    uri=update_uri,
+    crypto=ArtifactCryptoPolicy(
+        mode=CryptoMode.ENCRYPTED.value,
+        key_id="dev-shared-key",
+    ),
+)
+```
+
+drand timelock output:
+
+```python
+timelocked = ArtifactRef(
+    name="future_update",
+    uri=update_uri,
+    crypto=ArtifactCryptoPolicy(
+        mode=CryptoMode.DRAND_TIMELOCK.value,
+        drand_round=123456,
+    ),
+)
+```
+
+The executor wraps signed/encrypted/timelocked outputs in an `ArtifactEnvelope`.
+The validator verifies signatures, decrypts where possible, and reports
+timelocked artifacts as inconclusive until their reveal round is available.
+
+For CLI runs, set an owner default:
+
+```bash
+locus-v3 orchestrator \
+  --run-id RUN_ID \
+  --task mlp \
+  --crypto signed \
+  --required-signer assigned_hotkey
+```
+
+or:
+
+```bash
+locus-v3 orchestrator \
+  --run-id RUN_ID \
+  --task mlp \
+  --crypto drand-timelock \
+  --drand-round 123456
+```
+
 ## Lifecycle
 
 Use the v3 lifecycle helper to clean all prefixes owned by a run:

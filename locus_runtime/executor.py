@@ -11,7 +11,9 @@ import torch
 
 from locus_core.ir import Graph
 from locus_core.protocol import ArtifactDigest, ArtifactRef, JobManifestV3, JobReceiptV3, WorkerIdentity
+from locus_core.signatures import HmacSigner
 from . import tensor_io
+from .crypto import decode_envelope, encode_envelope, artifact_digest_from_blob, DrandTimelockProvider
 from .eval import evaluate
 from .storage import ObjectStore
 
@@ -24,6 +26,8 @@ class JobExecutor:
         device: str = "cpu",
         input_cache_mb: int = 1024,
         output_cache_mb: int = 256,
+        encryption_secret: str = "locus-dev-encryption",
+        timelock_provider: DrandTimelockProvider | None = None,
     ) -> None:
         self.bucket = bucket
         self.device = device
@@ -36,18 +40,16 @@ class JobExecutor:
         self._output_order: list[str] = []
         self._output_bytes = 0
         self._output_max = output_cache_mb * 1024 * 1024
+        self.encryption_secret = encryption_secret
+        self.timelock_provider = timelock_provider
 
     @staticmethod
-    def digest_body(name: str, uri: str, body: bytes) -> ArtifactDigest:
-        return ArtifactDigest(
-            name=name,
-            uri=uri,
-            sha256=hashlib.sha256(body).hexdigest(),
-            size_bytes=len(body),
-        )
+    def digest_body(name: str, uri: str, body: bytes, policy=None) -> ArtifactDigest:
+        data = artifact_digest_from_blob(name, uri, body, policy)
+        return ArtifactDigest(name=name, uri=uri, **data)
 
     def digest_artifact(self, ref: ArtifactRef) -> ArtifactDigest:
-        return self.digest_body(ref.name, ref.uri, self.bucket.get(ref.uri))
+        return self.digest_body(ref.name, ref.uri, self.bucket.get(ref.uri), ref.crypto)
 
     def fetch_graph(self, graph_sha: str, graph_uri: str) -> Graph:
         cached = self._graph_cache.get(graph_sha)
@@ -68,6 +70,13 @@ class JobExecutor:
         if cached_in is not None:
             return cached_in.to(self.device)
         body = self.bucket.get(ref.uri)
+        body = decode_envelope(
+            body,
+            ref.crypto,
+            verifier=HmacSigner("miner-dev-secret"),
+            encryption_secret=self.encryption_secret,
+            timelock_provider=self.timelock_provider,
+        )
         value = tensor_io.decode_tensor(body)
         if self.is_input_cacheable(ref.uri):
             self._cache_input(ref.uri, value)
@@ -161,12 +170,20 @@ class JobExecutor:
 
         put_jobs: list[tuple[str, bytes]] = []
         output_digests: list[ArtifactDigest] = []
+        artifact_signer = HmacSigner(miner_secret, identity=worker.hotkey_ss58)
         for ref in manifest.outputs:
             if ref.name not in outputs:
                 raise KeyError(f"graph did not produce output {ref.name!r}")
             body = self.encode_output(outputs[ref.name], json_uri=ref.uri.endswith(".json"))
+            body = encode_envelope(
+                body,
+                ref.crypto,
+                signer=artifact_signer,
+                encryption_secret=self.encryption_secret,
+                timelock_provider=self.timelock_provider,
+            )
             put_jobs.append((ref.uri, body))
-            output_digests.append(self.digest_body(ref.name, ref.uri, body))
+            output_digests.append(self.digest_body(ref.name, ref.uri, body, ref.crypto))
         with ThreadPoolExecutor(max_workers=min(len(put_jobs), 8) or 1) as ex:
             list(ex.map(lambda item: self.bucket.put(item[0], item[1]), put_jobs))
         for ref in manifest.outputs:

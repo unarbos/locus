@@ -18,6 +18,8 @@ class ValidatorNeuronConfig:
     miner_secret: str = "miner-dev-secret"
     device: str = "cpu"
     sample_rate: float = 1.0
+    encryption_secret: str = "locus-dev-encryption"
+    timelock_provider: object | None = None
     dry_run_weights: bool = True
     wallet_name: str | None = None
     hotkey_name: str | None = None
@@ -39,6 +41,8 @@ class ValidatorNeuron:
                 miner_secret=config.miner_secret,
                 device=config.device,
                 sample_rate=config.sample_rate,
+                encryption_secret=config.encryption_secret,
+                timelock_provider=config.timelock_provider,
             ),
         )
         self.subnet = BittensorAdapter(

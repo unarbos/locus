@@ -22,6 +22,7 @@ class MinerNeuronConfig:
     poll_interval: float = 0.1
     fault_mode: str = ""
     fault_rate: float = 1.0
+    encryption_secret: str = "locus-dev-encryption"
 
 
 class MinerNeuron:
@@ -41,6 +42,7 @@ class MinerNeuron:
                     poll_interval=config.poll_interval,
                     fault_mode=config.fault_mode,
                     fault_rate=config.fault_rate,
+                    encryption_secret=config.encryption_secret,
                 ),
             )
             for i, device in enumerate(config.devices)

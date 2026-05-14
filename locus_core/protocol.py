@@ -6,9 +6,114 @@ remain content-addressed Locus IR graphs.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from .signatures import digest_dict, sign_dict
+
+
+class CryptoMode(str, Enum):
+    NONE = "none"
+    SIGNED = "signed"
+    ENCRYPTED = "encrypted"
+    DRAND_TIMELOCK = "drand_timelock"
+
+
+@dataclass
+class ArtifactCryptoPolicy:
+    mode: str = CryptoMode.NONE.value
+    required_signer: str | None = None
+    recipient: str | None = None
+    cipher_suite: str = "xor-dev-v1"
+    key_id: str | None = None
+    drand_round: int | None = None
+    drand_chain_hash: str | None = None
+    drand_public_key: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "mode": str(self.mode),
+            "cipher_suite": self.cipher_suite,
+        }
+        for key in (
+            "required_signer",
+            "recipient",
+            "key_id",
+            "drand_round",
+            "drand_chain_hash",
+            "drand_public_key",
+        ):
+            value = getattr(self, key)
+            if value is not None:
+                out[key] = value
+        return out
+
+    @staticmethod
+    def from_dict(d: dict[str, Any] | None) -> "ArtifactCryptoPolicy":
+        d = dict(d or {})
+        return ArtifactCryptoPolicy(
+            mode=d.get("mode", CryptoMode.NONE.value),
+            required_signer=d.get("required_signer"),
+            recipient=d.get("recipient"),
+            cipher_suite=d.get("cipher_suite", "xor-dev-v1"),
+            key_id=d.get("key_id"),
+            drand_round=d.get("drand_round"),
+            drand_chain_hash=d.get("drand_chain_hash"),
+            drand_public_key=d.get("drand_public_key"),
+        )
+
+
+@dataclass
+class ArtifactEnvelope:
+    crypto_mode: str
+    payload_b64: str
+    plaintext_sha256: str
+    ciphertext_sha256: str
+    signer: str | None = None
+    signature: str | None = None
+    cipher_suite: str | None = None
+    key_id: str | None = None
+    drand_round: int | None = None
+    drand_chain_hash: str | None = None
+    drand_public_key: str | None = None
+    schema_version: int = 1
+
+    def signed_payload_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": int(self.schema_version),
+            "crypto_mode": self.crypto_mode,
+            "payload_b64": self.payload_b64,
+            "plaintext_sha256": self.plaintext_sha256,
+            "ciphertext_sha256": self.ciphertext_sha256,
+            "signer": self.signer,
+            "cipher_suite": self.cipher_suite,
+            "key_id": self.key_id,
+            "drand_round": self.drand_round,
+            "drand_chain_hash": self.drand_chain_hash,
+            "drand_public_key": self.drand_public_key,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        out = self.signed_payload_dict()
+        out["signature"] = self.signature
+        return out
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> "ArtifactEnvelope":
+        return ArtifactEnvelope(
+            schema_version=int(d.get("schema_version", 1)),
+            crypto_mode=d.get("crypto_mode", CryptoMode.NONE.value),
+            payload_b64=d["payload_b64"],
+            plaintext_sha256=d["plaintext_sha256"],
+            ciphertext_sha256=d["ciphertext_sha256"],
+            signer=d.get("signer"),
+            signature=d.get("signature"),
+            cipher_suite=d.get("cipher_suite"),
+            key_id=d.get("key_id"),
+            drand_round=d.get("drand_round"),
+            drand_chain_hash=d.get("drand_chain_hash"),
+            drand_public_key=d.get("drand_public_key"),
+        )
 
 
 @dataclass
@@ -17,6 +122,7 @@ class ArtifactRef:
     uri: str
     sha256: str | None = None
     size_bytes: int | None = None
+    crypto: ArtifactCryptoPolicy | None = None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"name": self.name, "uri": self.uri}
@@ -24,6 +130,8 @@ class ArtifactRef:
             out["sha256"] = self.sha256
         if self.size_bytes is not None:
             out["size_bytes"] = int(self.size_bytes)
+        if self.crypto is not None:
+            out["crypto"] = self.crypto.to_dict()
         return out
 
     @staticmethod
@@ -33,6 +141,7 @@ class ArtifactRef:
             uri=d["uri"],
             sha256=d.get("sha256"),
             size_bytes=d.get("size_bytes"),
+            crypto=ArtifactCryptoPolicy.from_dict(d.get("crypto")) if d.get("crypto") else None,
         )
 
 
@@ -42,14 +151,25 @@ class ArtifactDigest:
     uri: str
     sha256: str
     size_bytes: int
+    plaintext_sha256: str | None = None
+    ciphertext_sha256: str | None = None
+    envelope_sha256: str | None = None
+    signature: str | None = None
+    crypto_mode: str = CryptoMode.NONE.value
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "name": self.name,
             "uri": self.uri,
             "sha256": self.sha256,
             "size_bytes": int(self.size_bytes),
+            "crypto_mode": self.crypto_mode,
         }
+        for key in ("plaintext_sha256", "ciphertext_sha256", "envelope_sha256", "signature"):
+            value = getattr(self, key)
+            if value is not None:
+                out[key] = value
+        return out
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> "ArtifactDigest":
@@ -58,6 +178,11 @@ class ArtifactDigest:
             uri=d["uri"],
             sha256=d["sha256"],
             size_bytes=int(d["size_bytes"]),
+            plaintext_sha256=d.get("plaintext_sha256"),
+            ciphertext_sha256=d.get("ciphertext_sha256"),
+            envelope_sha256=d.get("envelope_sha256"),
+            signature=d.get("signature"),
+            crypto_mode=d.get("crypto_mode", CryptoMode.NONE.value),
         )
 
 

@@ -8,6 +8,7 @@ import threading
 import time
 import os
 
+from locus_core.protocol import ArtifactCryptoPolicy, CryptoMode
 from locus_miner.neuron import MinerNeuron, MinerNeuronConfig
 from locus_orchestrator.run_manager import RunConfig, RunManager
 from locus_orchestrator.streaming import StreamingRunConfig, StreamingRunManager
@@ -29,6 +30,20 @@ def build_bucket(args):
     return open_local_bucket(args.local_root, args.bucket)
 
 
+def build_crypto_policy(args) -> ArtifactCryptoPolicy | None:
+    mode = getattr(args, "crypto", "none")
+    if mode in ("none", "", None):
+        return None
+    if mode == "drand-timelock":
+        mode = CryptoMode.DRAND_TIMELOCK.value
+    return ArtifactCryptoPolicy(
+        mode=mode,
+        required_signer=getattr(args, "required_signer", None) or None,
+        key_id=getattr(args, "crypto_key_id", None) or None,
+        drand_round=getattr(args, "drand_round", None),
+    )
+
+
 def cmd_local_smoke(args: argparse.Namespace) -> int:
     root = args.local_root or tempfile.mkdtemp(prefix="locus-v3-")
     bucket = open_local_bucket(root, args.bucket)
@@ -47,6 +62,7 @@ def cmd_local_smoke(args: argparse.Namespace) -> int:
                     fault_mode=fault,
                     fault_rate=args.fault_rate,
                     miner_secret=args.miner_secret,
+                    encryption_secret=args.encryption_secret,
                 ),
             )
         )
@@ -55,7 +71,7 @@ def cmd_local_smoke(args: argparse.Namespace) -> int:
         t = threading.Thread(target=miner.loop, daemon=True)
         t.start()
         threads.append(t)
-    orch = RunManager(bucket=bucket, config=RunConfig(netuid=args.netuid, run_id=run_id, task=args.task, max_steps=args.steps, owner_secret=args.owner_secret))
+    orch = RunManager(bucket=bucket, config=RunConfig(netuid=args.netuid, run_id=run_id, task=args.task, max_steps=args.steps, owner_secret=args.owner_secret, crypto_policy=build_crypto_policy(args)))
     orch.run_loop(timeout_sec=args.timeout_sec)
     for miner in miners:
         miner.stop()
@@ -70,6 +86,7 @@ def cmd_local_smoke(args: argparse.Namespace) -> int:
             owner_secret=args.owner_secret,
             miner_secret=args.miner_secret,
             validator_secret=args.validator_secret,
+            encryption_secret=args.encryption_secret,
         ),
     )
     result = validator.run_once(max_receipts=10_000, publish_weights=True)
@@ -88,13 +105,14 @@ def cmd_orchestrator(args: argparse.Namespace) -> int:
                 task=args.task,
                 max_epochs=args.steps,
                 owner_secret=args.owner_secret,
+                crypto_policy=build_crypto_policy(args),
             ),
         )
         manager.run_loop(poll_interval=args.poll_interval, timeout_sec=args.timeout_sec)
         return 0
     manager = RunManager(
         bucket=bucket,
-        config=RunConfig(netuid=args.netuid, run_id=args.run_id, task=args.task, max_steps=args.steps, owner_secret=args.owner_secret),
+        config=RunConfig(netuid=args.netuid, run_id=args.run_id, task=args.task, max_steps=args.steps, owner_secret=args.owner_secret, crypto_policy=build_crypto_policy(args)),
     )
     manager.run_loop(poll_interval=args.poll_interval, timeout_sec=args.timeout_sec)
     return 0
@@ -114,6 +132,7 @@ def cmd_miner(args: argparse.Namespace) -> int:
             fault_mode=args.fault_mode,
             fault_rate=args.fault_rate,
             miner_secret=args.miner_secret,
+            encryption_secret=args.encryption_secret,
         ),
     )
     try:
@@ -140,6 +159,7 @@ def cmd_validator(args: argparse.Namespace) -> int:
             owner_secret=args.owner_secret,
             miner_secret=args.miner_secret,
             validator_secret=args.validator_secret,
+            encryption_secret=args.encryption_secret,
         ),
     )
     result = validator.run_once(max_receipts=args.max_receipts, publish_weights=args.publish_weights)
@@ -164,6 +184,13 @@ def add_bucket_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--aws-secret-access-key", default="")
 
 
+def add_crypto_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--crypto", choices=["none", "signed", "encrypted", "drand-timelock"], default="none")
+    p.add_argument("--crypto-key-id", default=None)
+    p.add_argument("--required-signer", default=None)
+    p.add_argument("--drand-round", type=int, default=None)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="locus-v3")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -184,6 +211,8 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--owner-secret", default=os.environ.get("LOCUS_OWNER_SECRET", "owner-dev-secret"))
     smoke.add_argument("--miner-secret", default=os.environ.get("LOCUS_MINER_SECRET", "miner-dev-secret"))
     smoke.add_argument("--validator-secret", default=os.environ.get("LOCUS_VALIDATOR_SECRET", "validator-dev-secret"))
+    smoke.add_argument("--encryption-secret", default=os.environ.get("LOCUS_ENCRYPTION_SECRET", "locus-dev-encryption"))
+    add_crypto_args(smoke)
     smoke.set_defaults(fn=cmd_local_smoke)
 
     orch = sub.add_parser("orchestrator")
@@ -195,6 +224,7 @@ def build_parser() -> argparse.ArgumentParser:
     orch.add_argument("--poll-interval", type=float, default=0.1)
     orch.add_argument("--timeout-sec", type=float, default=600.0)
     orch.add_argument("--owner-secret", default=os.environ.get("LOCUS_OWNER_SECRET", "owner-dev-secret"))
+    add_crypto_args(orch)
     orch.set_defaults(fn=cmd_orchestrator)
 
     miner = sub.add_parser("miner")
@@ -207,6 +237,7 @@ def build_parser() -> argparse.ArgumentParser:
     miner.add_argument("--fault-mode", default="")
     miner.add_argument("--fault-rate", type=float, default=1.0)
     miner.add_argument("--miner-secret", default=os.environ.get("LOCUS_MINER_SECRET", "miner-dev-secret"))
+    miner.add_argument("--encryption-secret", default=os.environ.get("LOCUS_ENCRYPTION_SECRET", "locus-dev-encryption"))
     miner.set_defaults(fn=cmd_miner)
 
     val = sub.add_parser("validator")
@@ -225,6 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
     val.add_argument("--owner-secret", default=os.environ.get("LOCUS_OWNER_SECRET", "owner-dev-secret"))
     val.add_argument("--miner-secret", default=os.environ.get("LOCUS_MINER_SECRET", "miner-dev-secret"))
     val.add_argument("--validator-secret", default=os.environ.get("LOCUS_VALIDATOR_SECRET", "validator-dev-secret"))
+    val.add_argument("--encryption-secret", default=os.environ.get("LOCUS_ENCRYPTION_SECRET", "locus-dev-encryption"))
     val.set_defaults(fn=cmd_validator)
 
     wipe = sub.add_parser("wipe-run")

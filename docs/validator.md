@@ -80,6 +80,18 @@ locus-v3 validator \
 The adapter normalizes non-negative scores before publishing. Hotkeys that do
 not map to current metagraph UIDs are dropped and reported.
 
+## Crypto-Aware Validation
+
+If a manifest output has an `ArtifactCryptoPolicy`, the validator enforces it:
+
+- `signed`: verify the artifact envelope signature before comparing tensors.
+- `encrypted`: decrypt the envelope before tensor decoding.
+- `drand_timelock`: decrypt only after the configured drand round is available.
+
+If a timelocked artifact is not yet revealable, the verdict is `inconclusive`
+rather than `fail`. Re-run the validator after the reveal round to settle the
+receipt.
+
 ## What Is Scored
 
 The validator builds score windows from receipts and verdicts:

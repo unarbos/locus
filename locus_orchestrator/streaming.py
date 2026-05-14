@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 
 from locus_core import paths
-from locus_core.protocol import ArtifactRef, GraphRef, JobManifestV3, MinerIdentity, VerificationPolicy, WorkerIdentity
+from locus_core.protocol import ArtifactCryptoPolicy, ArtifactRef, GraphRef, JobManifestV3, MinerIdentity, VerificationPolicy, WorkerIdentity
 from locus_runtime.storage import ObjectStore
 from locus_tasks import load_streaming_task
 from .scheduler import QuotaBook
@@ -23,6 +23,7 @@ class StreamingRunConfig:
     task: str = "gpt_pipe"
     max_epochs: int = 1
     owner_secret: str = "owner-dev-secret"
+    crypto_policy: ArtifactCryptoPolicy | None = None
 
 
 class StreamingRunManager:
@@ -97,7 +98,7 @@ class StreamingRunManager:
         inputs: list[ArtifactRef] = []
         if s != 0:
             for name, _shape, _dtype in stage.forward_input_specs:
-                inputs.append(ArtifactRef(name=name, uri=self.fwd_output_uri(epoch, s - 1, mb, name)))
+                inputs.append(ArtifactRef(name=name, uri=self.fwd_output_uri(epoch, s - 1, mb, name), crypto=self.config.crypto_policy))
         if stage.weights_input_name and self.params.training:
             inputs.append(ArtifactRef(name=stage.weights_input_name, uri=self.epoch_weights_uri(epoch, s)))
         is_tail = s == self.params.n_stages - 1
@@ -107,9 +108,9 @@ class StreamingRunManager:
         for name, (uri, scope) in self.params.static_inputs.items():
             if scope == "all" or (scope == "head" and is_head) or (scope == "tail" and is_tail) or (scope == "head_and_tail" and (is_head or is_tail)):
                 inputs.append(ArtifactRef(name=name, uri=uri))
-        outputs = [ArtifactRef(name=name, uri=self.fwd_output_uri(epoch, s, mb, name)) for name, _shape, _dtype in stage.forward_output_specs]
+        outputs = [self.output_ref(name=name, uri=self.fwd_output_uri(epoch, s, mb, name)) for name, _shape, _dtype in stage.forward_output_specs]
         if is_tail:
-            outputs.append(ArtifactRef(name="loss" if self.params.training else "done", uri=self.fwd_done_uri(epoch, s, mb)))
+            outputs.append(self.output_ref(name="loss" if self.params.training else "done", uri=self.fwd_done_uri(epoch, s, mb)))
         return self.emit_job(
             job_id=f"j-e{epoch}-s{s}-mb{mb}-fwd",
             kind="pipe_forward",
@@ -126,17 +127,17 @@ class StreamingRunManager:
         is_head = s == 0
         inputs = [ArtifactRef(name=stage.weights_input_name or "W", uri=self.epoch_weights_uri(epoch, s))]
         if not is_head:
-            inputs.append(ArtifactRef(name="x_in", uri=self.fwd_output_uri(epoch, s - 1, mb, "x")))
+            inputs.append(ArtifactRef(name="x_in", uri=self.fwd_output_uri(epoch, s - 1, mb, "x"), crypto=self.config.crypto_policy))
         if is_tail and self.params.target_static_uri:
             inputs.append(ArtifactRef(name="target", uri=self.params.target_static_uri))
         for name, (uri, scope) in self.params.static_inputs.items():
             if scope == "all" or (scope == "head" and is_head) or (scope == "tail" and is_tail) or (scope == "head_and_tail" and (is_head or is_tail)):
                 inputs.append(ArtifactRef(name=name, uri=uri))
         if not is_tail:
-            inputs.append(ArtifactRef(name="dL_dx_out", uri=self.bwd_output_uri(epoch, s + 1, mb, "dL_dx_in")))
-        outputs = [ArtifactRef(name="dW", uri=self.bwd_output_uri(epoch, s, mb, "dW"))]
+            inputs.append(ArtifactRef(name="dL_dx_out", uri=self.bwd_output_uri(epoch, s + 1, mb, "dL_dx_in"), crypto=self.config.crypto_policy))
+        outputs = [self.output_ref(name="dW", uri=self.bwd_output_uri(epoch, s, mb, "dW"))]
         if not is_head and stage.backward_emits_dx_in:
-            outputs.append(ArtifactRef(name="dL_dx_in", uri=self.bwd_output_uri(epoch, s, mb, "dL_dx_in")))
+            outputs.append(self.output_ref(name="dL_dx_in", uri=self.bwd_output_uri(epoch, s, mb, "dL_dx_in")))
         return self.emit_job(
             job_id=f"j-e{epoch}-s{s}-mb{mb}-bwd",
             kind="pipe_backward",
@@ -151,8 +152,8 @@ class StreamingRunManager:
         s = stage.stage_id
         inputs = [ArtifactRef(name=stage.weights_input_name or "W", uri=self.epoch_weights_uri(epoch, s))]
         for mb in range(self.params.n_microbatches):
-            inputs.append(ArtifactRef(name=f"dW_{mb}", uri=self.bwd_output_uri(epoch, s, mb, "dW")))
-        outputs = [ArtifactRef(name="W_new", uri=self.epoch_weights_uri(epoch + 1, s))]
+            inputs.append(ArtifactRef(name=f"dW_{mb}", uri=self.bwd_output_uri(epoch, s, mb, "dW"), crypto=self.config.crypto_policy))
+        outputs = [self.output_ref(name="W_new", uri=self.epoch_weights_uri(epoch + 1, s))]
         return self.emit_job(
             job_id=f"j-e{epoch}-s{s}-outer",
             kind="pipe_outer",
@@ -167,6 +168,7 @@ class StreamingRunManager:
         worker = self.quota.pick_worker()
         now = int(time.time())
         sha = graph.graph_id()
+        outputs = [self.resolve_output_crypto(ref, worker) for ref in outputs]
         manifest = JobManifestV3(
             job_id=job_id,
             run_id=self.config.run_id,
@@ -219,3 +221,14 @@ class StreamingRunManager:
 
     def bwd_output_uri(self, epoch: int, stage_id: int, mb: int, name: str) -> str:
         return self.bucket.uri_for_key(f"runs/{self.config.run_id}/streaming/epoch={epoch}/stage={stage_id}/bwd/mb={mb}/{name}.bin")
+
+    def output_ref(self, *, name: str, uri: str) -> ArtifactRef:
+        return ArtifactRef(name=name, uri=uri, crypto=self.config.crypto_policy)
+
+    @staticmethod
+    def resolve_output_crypto(ref: ArtifactRef, worker: WorkerIdentity) -> ArtifactRef:
+        if ref.crypto is None or ref.crypto.required_signer != "assigned_hotkey":
+            return ref
+        crypto = ArtifactCryptoPolicy.from_dict(ref.crypto.to_dict())
+        crypto.required_signer = worker.hotkey_ss58
+        return ArtifactRef(name=ref.name, uri=ref.uri, sha256=ref.sha256, size_bytes=ref.size_bytes, crypto=crypto)
