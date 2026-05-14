@@ -13,8 +13,9 @@ import torch
 from locus_core import paths
 from locus_core.ir import Graph
 from locus_core.protocol import ArtifactDigest, ArtifactRef, JobManifestV3, JobReceiptV3, MinerScoreWindow, VerificationVerdictV3
-from locus_core.signatures import verify_dict
+from locus_core.signatures import HmacSigner, verify_dict
 from locus_runtime import tensor_io
+from locus_runtime.crypto import decode_envelope, TimelockPending, DrandTimelockProvider
 from locus_runtime.eval import evaluate
 from locus_runtime.storage import ObjectStore
 
@@ -30,6 +31,8 @@ class ValidatorConfig:
     device: str = "cpu"
     sample_rate: float = 1.0
     max_sample_elements: int = 4096
+    encryption_secret: str = "locus-dev-encryption"
+    timelock_provider: DrandTimelockProvider | None = None
 
 
 class ReplayVerifier:
@@ -102,6 +105,12 @@ class ReplayVerifier:
             status = "pass" if ok else "fail"
             reason = "all outputs matched" if ok else "; ".join(reasons[:4])
             return self.verdict(receipt, status, reason, replay_compute, comparison, t0)
+        except TimelockPending as e:
+            comparison["crypto_pending"] = str(e)
+            return self.verdict(receipt, "inconclusive", str(e), 0.0, comparison, t0)
+        except ValueError as e:
+            comparison["verification_error"] = str(e)
+            return self.verdict(receipt, "fail", str(e), 0.0, comparison, t0)
         except Exception as e:
             comparison["error"] = repr(e)
             return self.verdict(receipt, "inconclusive", str(e), 0.0, comparison, t0)
@@ -142,9 +151,21 @@ class ReplayVerifier:
             body = self.bucket.get(ref.uri)
             sha = hashlib.sha256(body).hexdigest()
             exp = expected.get(ref.name)
-            comparison["inputs"][ref.name] = {"sha256": sha, "size_bytes": len(body), "matches_receipt": exp is None or exp.sha256 == sha}
-            if exp is not None and exp.sha256 != sha:
+            comparison["inputs"][ref.name] = {
+                "sha256": sha,
+                "size_bytes": len(body),
+                "matches_receipt": exp is None or exp.sha256 == sha or exp.envelope_sha256 == sha,
+                "crypto_mode": ref.crypto.mode if ref.crypto else "none",
+            }
+            if exp is not None and exp.sha256 != sha and exp.envelope_sha256 != sha:
                 raise ValueError(f"input changed: {ref.name}")
+            body = decode_envelope(
+                body,
+                ref.crypto,
+                verifier=HmacSigner(self.config.miner_secret),
+                encryption_secret=self.config.encryption_secret,
+                timelock_provider=self.config.timelock_provider,
+            )
             inputs[ref.name] = tensor_io.decode_tensor(body).to(self.config.device)
         return inputs
 
@@ -152,10 +173,24 @@ class ReplayVerifier:
         if expected_value is None:
             return False, {"status": "fail", "reason": "missing replay output"}
         if ref.uri.endswith(".json"):
-            observed_json = json.loads(self.bucket.get(ref.uri).decode("utf-8"))
+            observed_body = decode_envelope(
+                self.bucket.get(ref.uri),
+                ref.crypto,
+                verifier=HmacSigner(self.config.miner_secret),
+                encryption_secret=self.config.encryption_secret,
+                timelock_provider=self.config.timelock_provider,
+            )
+            observed_json = json.loads(observed_body.decode("utf-8"))
             observed = torch.as_tensor(observed_json.get("value"), device=self.config.device)
         else:
-            observed = tensor_io.decode_tensor(self.bucket.get(ref.uri)).to(self.config.device)
+            observed_body = decode_envelope(
+                self.bucket.get(ref.uri),
+                ref.crypto,
+                verifier=HmacSigner(self.config.miner_secret),
+                encryption_secret=self.config.encryption_secret,
+                timelock_provider=self.config.timelock_provider,
+            )
+            observed = tensor_io.decode_tensor(observed_body).to(self.config.device)
         if not isinstance(expected_value, torch.Tensor):
             return False, {"status": "fail", "reason": "non-tensor replay output"}
         expected = expected_value.detach().to(self.config.device)
@@ -186,6 +221,7 @@ class ReplayVerifier:
             "checked_elements": int(obs.numel()),
             "total_elements": total,
             "max_abs_error": max_abs,
+            "crypto_mode": ref.crypto.mode if ref.crypto else "none",
         }
 
     def verdict(

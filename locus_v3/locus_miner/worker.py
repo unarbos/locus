@@ -28,6 +28,7 @@ class WorkerConfig:
     heartbeat_interval: float = 1.0
     fault_mode: str = ""
     fault_rate: float = 1.0
+    encryption_secret: str = "locus-dev-encryption"
     max_idle_iters: int | None = None
 
 
@@ -36,7 +37,7 @@ class MinerWorker:
         self.bucket = bucket
         self.config = config
         self.stop_event = threading.Event()
-        self.executor = JobExecutor(bucket=bucket, device=config.device)
+        self.executor = JobExecutor(bucket=bucket, device=config.device, encryption_secret=config.encryption_secret)
         self.identity = WorkerIdentity(
             hotkey_ss58=config.hotkey_ss58,
             worker_id=config.worker_id,

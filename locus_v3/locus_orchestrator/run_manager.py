@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 
 from locus_core import paths
-from locus_core.protocol import ArtifactRef, GraphRef, JobManifestV3, MinerIdentity, VerificationPolicy, WorkerIdentity
+from locus_core.protocol import ArtifactCryptoPolicy, ArtifactRef, GraphRef, JobManifestV3, MinerIdentity, VerificationPolicy, WorkerIdentity
 from locus_runtime import tensor_io
 from locus_runtime.storage import ObjectStore
 from locus_tasks import load_task
@@ -20,6 +20,7 @@ class RunConfig:
     task: str = "mlp"
     max_steps: int = 1
     owner_secret: str = "owner-dev-secret"
+    crypto_policy: ArtifactCryptoPolicy | None = None
 
 
 class RunManager:
@@ -124,11 +125,11 @@ class RunManager:
     def emit_forward(self, step: int) -> JobManifestV3:
         worker = self.quota.pick_worker()
         outputs = [
-            ArtifactRef(name=f"target_{ub}", uri=self.bucket.uri_for_key(paths.target_key(self.config.netuid, self.config.run_id, step, ub)))
+            self.output_ref(name=f"target_{ub}", uri=self.bucket.uri_for_key(paths.target_key(self.config.netuid, self.config.run_id, step, ub)))
             for ub in range(self.task.N_UB)
         ]
         inputs = [
-            ArtifactRef(name=f"weights_{ub}", uri=self.bucket.uri_for_key(paths.weights_key(self.config.netuid, self.config.run_id, step, ub)))
+            self.weight_ref(name=f"weights_{ub}", step=step, ub=ub)
             for ub in range(self.task.N_UB)
         ]
         return self.emit_job("forward_pass", step, self.graphs["forward"], {"round_id": step}, inputs, outputs, worker)
@@ -136,17 +137,20 @@ class RunManager:
     def emit_inner(self, step: int, ub: int, replica: int) -> JobManifestV3:
         worker = self.quota.pick_worker()
         job_id = f"step{step}-ub{ub}-inner-r{replica}"
+        forward_job = self.load_job(f"step{step}-forward_pass")
+        target_ref = forward_job.outputs[ub]
         outputs = [
             ArtifactRef(
                 name="delta",
                 uri=self.bucket.uri_for_key(
                     paths.artifact_key(self.config.netuid, self.config.run_id, job_id, worker.hotkey_ss58, worker.worker_id, 0, "delta")
                 ),
+                crypto=self.config.crypto_policy,
             )
         ]
         inputs = [
-            ArtifactRef(name="weights", uri=self.bucket.uri_for_key(paths.weights_key(self.config.netuid, self.config.run_id, step, ub))),
-            ArtifactRef(name="target", uri=self.bucket.uri_for_key(paths.target_key(self.config.netuid, self.config.run_id, step, ub))),
+            self.weight_ref(name="weights", step=step, ub=ub),
+            ArtifactRef(name="target", uri=target_ref.uri, crypto=target_ref.crypto),
         ]
         return self.emit_job("inner_step", step, self.graphs["inner"], {"ub": ub, "replica": replica}, inputs, outputs, worker, job_id=job_id)
 
@@ -162,31 +166,32 @@ class RunManager:
             ArtifactRef(
                 name="reduced",
                 uri=self.bucket.uri_for_key(paths.artifact_key(self.config.netuid, self.config.run_id, f"step{step}-ub{ub}-reduce", worker.hotkey_ss58, worker.worker_id, 0, "reduced")),
+                crypto=self.config.crypto_policy,
             )
         ]
-        inputs = [ArtifactRef(name=f"d_{i}", uri=ref.uri) for i, ref in enumerate(deltas)]
+        inputs = [ArtifactRef(name=f"d_{i}", uri=ref.uri, crypto=ref.crypto) for i, ref in enumerate(deltas)]
         return self.emit_job("reduce", step, graph, {"ub": ub, "n_inputs": len(inputs)}, inputs, outputs, worker, job_id=f"step{step}-ub{ub}-reduce")
 
     def emit_outer(self, step: int, ub: int) -> JobManifestV3:
         worker = self.quota.pick_worker()
         reduce_job = self.load_job(f"step{step}-ub{ub}-reduce")
         inputs = [
-            ArtifactRef(name="weights", uri=self.bucket.uri_for_key(paths.weights_key(self.config.netuid, self.config.run_id, step, ub))),
+            self.weight_ref(name="weights", step=step, ub=ub),
             ArtifactRef(name="reduced_delta", uri=reduce_job.outputs[0].uri),
         ]
         outputs = [
-            ArtifactRef(name="new_weights", uri=self.bucket.uri_for_key(paths.weights_key(self.config.netuid, self.config.run_id, step + 1, ub)))
+            self.output_ref(name="new_weights", uri=self.bucket.uri_for_key(paths.weights_key(self.config.netuid, self.config.run_id, step + 1, ub)))
         ]
         return self.emit_job("outer_step", step, self.graphs["outer"], {"ub": ub}, inputs, outputs, worker, job_id=f"step{step}-ub{ub}-outer")
 
     def emit_eval(self, step: int) -> JobManifestV3:
         worker = self.quota.pick_worker()
         inputs = [
-            ArtifactRef(name=f"weights_{ub}", uri=self.bucket.uri_for_key(paths.weights_key(self.config.netuid, self.config.run_id, step + 1, ub)))
+            self.weight_ref(name=f"weights_{ub}", step=step + 1, ub=ub)
             for ub in range(self.task.N_UB)
         ]
         outputs = [
-            ArtifactRef(name="metrics", uri=self.bucket.uri_for_key(f"{paths.run_root(self.config.netuid, self.config.run_id)}/metrics/step={step}.json"))
+            self.output_ref(name="metrics", uri=self.bucket.uri_for_key(f"{paths.run_root(self.config.netuid, self.config.run_id)}/metrics/step={step}.json"))
         ]
         return self.emit_job("eval", step, self.graphs["eval"], {"round_id": step + 1}, inputs, outputs, worker, job_id=f"step{step}-eval")
 
@@ -208,6 +213,7 @@ class RunManager:
         if not self.bucket.exists(graph_uri):
             self.bucket.put(graph_uri, graph.to_canonical_json())
         job_id = job_id or f"step{step}-{kind}"
+        outputs = [self.resolve_output_crypto(ref, worker) for ref in outputs]
         manifest = JobManifestV3(
             job_id=job_id,
             run_id=self.config.run_id,
@@ -268,3 +274,27 @@ class RunManager:
 
     def _save_state(self, state: dict) -> None:
         self.bucket.put_json(self.bucket.uri_for_key(paths.state_key(self.config.netuid, self.config.run_id)), state)
+
+    def output_ref(self, *, name: str, uri: str) -> ArtifactRef:
+        return ArtifactRef(name=name, uri=uri, crypto=self.config.crypto_policy)
+
+    def weight_ref(self, *, name: str, step: int, ub: int) -> ArtifactRef:
+        return ArtifactRef(
+            name=name,
+            uri=self.bucket.uri_for_key(paths.weights_key(self.config.netuid, self.config.run_id, step, ub)),
+            crypto=self.config.crypto_policy if step > 0 else None,
+        )
+
+    @staticmethod
+    def resolve_output_crypto(ref: ArtifactRef, worker: WorkerIdentity) -> ArtifactRef:
+        if ref.crypto is None or ref.crypto.required_signer != "assigned_hotkey":
+            return ref
+        crypto = ArtifactCryptoPolicy.from_dict(ref.crypto.to_dict())
+        crypto.required_signer = worker.hotkey_ss58
+        return ArtifactRef(
+            name=ref.name,
+            uri=ref.uri,
+            sha256=ref.sha256,
+            size_bytes=ref.size_bytes,
+            crypto=crypto,
+        )
