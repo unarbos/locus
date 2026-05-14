@@ -1,0 +1,44 @@
+[project]
+name = "locus-v3"
+version = "0.3.0"
+description = "Locus v3: subnet-ready bucket-native distributed training"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "numpy>=1.26",
+    "python-dotenv>=1.0",
+    "boto3>=1.34",
+]
+
+[project.optional-dependencies]
+subnet = ["bittensor>=9.0"]
+lium = ["lium.io>=0.0.15"]
+test = ["pytest>=8.0"]
+
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = [
+    "locus_core",
+    "locus_runtime",
+    "locus_orchestrator",
+    "locus_miner",
+    "locus_validator",
+    "locus_tasks",
+    "bench",
+]
+
+[project.scripts]
+locus-v3 = "locus_core.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "s3: requires LOCUS_TEST_S3=1 and bucket credentials",
+    "lium: requires LOCUS_TEST_LIUM=1 and LIUM_API_KEY",
+    "subnet: requires LOCUS_TEST_SUBNET=1 and Bittensor wallet config",
+]
