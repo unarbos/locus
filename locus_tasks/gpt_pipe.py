@@ -1119,11 +1119,25 @@ def build_streaming_inputs(*, bucket: LocalBucket, run_id: str):
     }
     prices = dict(default_prices)
     prices.update(cfg.get("gpu_class_price_per_hour", {}) or {})
+    tp_size = int(cfg.get("tensor_parallel_size", 1) or 1)
+    common_params = {}
+    if bool(cfg.get("enable_tensor_parallel_runner", False)) and tp_size > 1:
+        common_params = {
+            "distributed_runner": "gpt_tensor_parallel_v1",
+            "tp_world_size": tp_size,
+            "parallelism": {"tensor_parallel_size": tp_size, "scope": "stage"},
+            "resource_requirements": {
+                "min_gpus": tp_size,
+                "placement": "single_host",
+                "parallelism": {"tensor_parallel_size": tp_size, "scope": "stage"},
+            },
+        }
 
     params = StreamingParams(
         n_stages=N_STAGES,
         n_microbatches=n_microbatches,
         max_epochs=max_epochs,
+        common_params=common_params,
         training=True,
         target_static_uri=None,   # CE loss is built into the tail stage graph
         lr=LR,

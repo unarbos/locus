@@ -10,8 +10,9 @@ import time
 from dataclasses import dataclass
 
 from locus_core import paths
-from locus_core.protocol import ArtifactCryptoPolicy, ArtifactRef, AssignmentGrantV3, GraphRef, JobManifestV3, MinerIdentity, VerificationPolicy, WorkerIdentity
-from locus_core.wallet_crypto import DevAssignmentCrypto
+from locus_core.metagraph import BtcliMetagraphHotkeyResolver, MetagraphHotkeyResolver
+from locus_core.protocol import ArtifactCryptoPolicy, ArtifactRef, AssignmentGrantV3, GraphRef, JobManifestV3, MinerIdentity, ResourceRequirements, VerificationPolicy, WorkerIdentity
+from locus_core.wallet_crypto import AssignmentEncryptor, DevAssignmentCrypto, Ed25519SealedBoxAssignmentCrypto
 from locus_runtime.grants import broker_for_mode
 from locus_runtime.storage import ObjectStore
 from locus_tasks import load_streaming_task
@@ -29,6 +30,8 @@ class StreamingRunConfig:
     grant_mode: str = "direct"
     grant_ttl_sec: int = 600
     assignment_secret: str = "locus-dev-assignment"
+    assignment_crypto: str = "dev"
+    network: str = "finney"
 
 
 class StreamingRunManager:
@@ -40,7 +43,16 @@ class StreamingRunManager:
         self.emitted: list[str] = []
         self.jobs: dict[str, JobManifestV3] = {}
         self.grant_broker = broker_for_mode(config.grant_mode, bucket)
-        self.assignment_crypto = DevAssignmentCrypto(config.assignment_secret)
+        self.assignment_crypto: AssignmentEncryptor = (
+            Ed25519SealedBoxAssignmentCrypto()
+            if config.assignment_crypto == "ed25519"
+            else DevAssignmentCrypto(config.assignment_secret)
+        )
+        self.hotkey_resolver: MetagraphHotkeyResolver | None = (
+            BtcliMetagraphHotkeyResolver(netuid=config.netuid, network=config.network)
+            if config.assignment_crypto == "ed25519"
+            else None
+        )
 
     def bootstrap(self) -> None:
         self.task.bootstrap(bucket=self.bucket, run_id=self.config.run_id, max_rounds=self.config.max_epochs)
@@ -179,7 +191,8 @@ class StreamingRunManager:
         )
 
     def emit_job(self, *, job_id: str, kind: str, step_id: int, graph, params: dict, inputs: list[ArtifactRef], outputs: list[ArtifactRef]) -> JobManifestV3:
-        worker = self.quota.pick_worker()
+        requirements = self.resource_requirements(params)
+        worker = self.quota.pick_worker(requirements=requirements)
         now = int(time.time())
         sha = graph.graph_id()
         outputs = [self.resolve_output_crypto(ref, worker) for ref in outputs]
@@ -197,6 +210,7 @@ class StreamingRunManager:
             attempt=0,
             deadline_unix=now + int(self.params.deadline_seconds),
             created_unix=now,
+            resource_requirements=requirements,
             verification_policy=VerificationPolicy(critical=kind == "pipe_outer"),
         ).sign(self.config.owner_secret)
         self.bucket.put_json(self.bucket.uri_for_key(paths.job_manifest_key(self.config.netuid, self.config.run_id, job_id)), manifest.to_dict())
@@ -249,6 +263,15 @@ class StreamingRunManager:
         crypto.required_signer = worker.hotkey_ss58
         return ArtifactRef(name=ref.name, uri=ref.uri, sha256=ref.sha256, size_bytes=ref.size_bytes, crypto=crypto)
 
+    @staticmethod
+    def resource_requirements(params: dict) -> ResourceRequirements:
+        raw = params.get("resource_requirements") or {}
+        if not raw and params.get("distributed_runner") == "gpt_tensor_parallel_v1":
+            parallelism = dict(params.get("parallelism") or {})
+            world_size = int(parallelism.get("tensor_parallel_size") or params.get("tp_world_size") or 1)
+            raw = {"min_gpus": world_size, "placement": "single_host", "parallelism": parallelism}
+        return ResourceRequirements.from_dict(raw)
+
     def emit_assignment_grant(self, manifest: JobManifestV3) -> None:
         if self.grant_broker is None:
             return
@@ -267,13 +290,37 @@ class StreamingRunManager:
             run_id=manifest.run_id,
             assigned_hotkey=manifest.assigned_hotkey,
             input_gets=[self.grant_broker.get_grant(ref.uri, expires_in=self.config.grant_ttl_sec) for ref in manifest.inputs],
-            output_puts=[self.grant_broker.put_grant(ref.uri, expires_in=self.config.grant_ttl_sec) for ref in manifest.outputs],
+            output_puts=[self.grant_broker.put_grant(uri, expires_in=self.config.grant_ttl_sec) for uri in self.output_grant_uris(manifest)],
             receipt_put=self.grant_broker.put_grant(receipt_uri, expires_in=self.config.grant_ttl_sec),
             created_unix=now,
             expires_unix=now + int(self.config.grant_ttl_sec),
         )
-        encrypted = self.assignment_crypto.encrypt_for_hotkey(grant, recipient_hotkey=manifest.assigned_hotkey)
+        if self.hotkey_resolver is not None:
+            hotkey_info = self.hotkey_resolver.resolve(manifest.assigned_hotkey)
+            encrypted = self.assignment_crypto.encrypt_for_hotkey(
+                grant,
+                recipient_hotkey=manifest.assigned_hotkey,
+                recipient_uid=hotkey_info.uid,
+                metagraph_block=hotkey_info.block,
+                metagraph_hash=hotkey_info.metagraph_hash,
+                recipient_public_key=hotkey_info.public_key,
+            )
+        else:
+            encrypted = self.assignment_crypto.encrypt_for_hotkey(grant, recipient_hotkey=manifest.assigned_hotkey)
         self.bucket.put_json(
             self.bucket.uri_for_key(paths.assignment_key(self.config.netuid, manifest.run_id, manifest.job_id, manifest.assigned_hotkey)),
             encrypted.to_dict(),
         )
+
+    @staticmethod
+    def output_grant_uris(manifest: JobManifestV3) -> list[str]:
+        out = [ref.uri for ref in manifest.outputs]
+        sharding = dict(manifest.params.get("output_sharding") or {})
+        for ref in manifest.outputs:
+            cfg = sharding.get(ref.name)
+            if not cfg:
+                continue
+            base = ref.uri[:-5] if ref.uri.endswith(".json") else ref.uri
+            for rank in range(int(cfg.get("world_size", manifest.resource_requirements.min_gpus))):
+                out.append(f"{base}.rank{rank}.bin")
+        return out

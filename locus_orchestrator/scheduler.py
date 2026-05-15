@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from locus_core.protocol import MinerIdentity, WorkerIdentity
+from locus_core.protocol import MinerIdentity, ResourceRequirements, WorkerIdentity
 
 
 @dataclass
@@ -38,13 +38,16 @@ class QuotaBook:
             )
             account.workers[worker.worker_id] = worker
 
-    def pick_worker(self, *, estimated_cu: float = 1.0) -> WorkerIdentity:
+    def pick_worker(self, *, estimated_cu: float = 1.0, requirements: ResourceRequirements | None = None) -> WorkerIdentity:
+        requirements = requirements or ResourceRequirements()
         candidates: list[tuple[float, WorkerIdentity, MinerAccount]] = []
         for account in self.accounts.values():
             if account.available_quota < estimated_cu or not account.workers:
                 continue
             priority = account.trust_multiplier * (1.0 + len(account.workers)) / max(1.0, account.inflight_cu)
             for worker in account.workers.values():
+                if not self.worker_satisfies(worker, requirements):
+                    continue
                 candidates.append((priority, worker, account))
         if not candidates:
             raise RuntimeError("no miner workers have quota for assignment")
@@ -52,6 +55,15 @@ class QuotaBook:
         _priority, worker, account = candidates[0]
         account.inflight_cu += estimated_cu
         return worker
+
+    @staticmethod
+    def worker_satisfies(worker: WorkerIdentity, requirements: ResourceRequirements) -> bool:
+        world_size = int(worker.capabilities.get("world_size") or len(worker.device_group) or (1 if worker.gpu_index is not None else 0))
+        if requirements.min_gpus > world_size:
+            return False
+        if requirements.placement == "single_host" and requirements.min_gpus > 1 and not worker.worker_group_id:
+            return False
+        return True
 
     def release(self, hotkey: str, estimated_cu: float = 1.0) -> None:
         account = self.accounts.get(hotkey)

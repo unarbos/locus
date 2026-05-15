@@ -106,6 +106,43 @@ def verdict_key(netuid: int, run_id: str, validator_hotkey: str, receipt_id: str
     return f"{verdicts_prefix(netuid, run_id)}validator={validator_hotkey}/{safe}.json"
 
 
+def auditors_prefix(netuid: int) -> str:
+    return f"{root(netuid)}/auditors/"
+
+
+def auditor_heartbeat_key(netuid: int, auditor_hotkey: str, worker_id: str) -> str:
+    return f"{auditors_prefix(netuid)}{auditor_hotkey}/workers/{worker_id}/heartbeat.json"
+
+
+def audit_root(netuid: int, run_id: str) -> str:
+    return f"{root(netuid)}/audits/{run_id}"
+
+
+def audit_jobs_prefix(netuid: int, run_id: str) -> str:
+    return f"{audit_root(netuid, run_id)}/jobs/"
+
+
+def audit_job_manifest_key(netuid: int, run_id: str, job_id: str) -> str:
+    return f"{audit_jobs_prefix(netuid, run_id)}{job_id}/manifest.json"
+
+
+def audit_job_index_key(netuid: int, run_id: str) -> str:
+    return f"{audit_jobs_prefix(netuid, run_id)}index.json"
+
+
+def audit_assignment_key(netuid: int, run_id: str, job_id: str, auditor_hotkey: str) -> str:
+    return f"{audit_root(netuid, run_id)}/assignments/{job_id}/hotkey={auditor_hotkey}.json"
+
+
+def audit_result_key(netuid: int, run_id: str, auditor_hotkey: str, receipt_id: str) -> str:
+    safe = receipt_id.replace("/", "_").replace(":", "_")
+    return f"{audit_root(netuid, run_id)}/results/auditor={auditor_hotkey}/{safe}.json"
+
+
+def audit_results_prefix(netuid: int, run_id: str) -> str:
+    return f"{audit_root(netuid, run_id)}/results/"
+
+
 def scores_key(netuid: int, window_id: str) -> str:
     return f"{root(netuid)}/scores/window={window_id}/scores.json"
 
@@ -118,4 +155,5 @@ def run_prefixes(netuid: int, run_id: str) -> list[str]:
         f"{root(netuid)}/artifacts/{run_id}/",
         receipts_prefix(netuid, run_id),
         verdicts_prefix(netuid, run_id),
+        audit_root(netuid, run_id) + "/",
     ]

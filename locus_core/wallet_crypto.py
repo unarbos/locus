@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import NoReturn
 
 from .protocol import AssignmentGrantV3, EncryptedAssignmentGrantV3
@@ -28,6 +29,7 @@ class AssignmentEncryptor:
         recipient_uid: int | None = None,
         metagraph_block: int | None = None,
         metagraph_hash: str | None = None,
+        recipient_public_key: bytes | str | None = None,
     ) -> EncryptedAssignmentGrantV3:
         raise NotImplementedError
 
@@ -73,6 +75,83 @@ class DevAssignmentCrypto(AssignmentEncryptor, AssignmentDecryptor):
             raise ValueError("assignment grant recipient hotkey mismatch")
         ciphertext = base64.b64decode(encrypted.ciphertext_b64.encode("ascii"))
         plaintext = xor_crypt(ciphertext, key=f"{self.secret}:{expected_hotkey}")
+        return AssignmentGrantV3.from_dict(json.loads(plaintext.decode("utf-8")))
+
+
+@dataclass
+class Ed25519SealedBoxAssignmentCrypto(AssignmentEncryptor, AssignmentDecryptor):
+    """Anonymous sealed-box grants for native ED25519 Bittensor hotkeys."""
+
+    seed: bytes | None = None
+    scheme: str = "locus-ed25519-sealedbox-v1"
+
+    @staticmethod
+    def from_keyfile(path: str | Path) -> "Ed25519SealedBoxAssignmentCrypto":
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        crypto_type = data.get("cryptoType")
+        if crypto_type != 0:
+            raise ValueError(f"expected native ED25519 cryptoType 0 hotkey, got {crypto_type!r}")
+        seed_hex = str(data.get("secretSeed") or "").removeprefix("0x")
+        if not seed_hex:
+            raise ValueError("native ED25519 hotkey file is missing secretSeed")
+        seed = bytes.fromhex(seed_hex)
+        if len(seed) != 32:
+            raise ValueError(f"expected 32-byte ED25519 seed, got {len(seed)} bytes")
+        return Ed25519SealedBoxAssignmentCrypto(seed=seed)
+
+    def encrypt_for_hotkey(
+        self,
+        grant: AssignmentGrantV3,
+        *,
+        recipient_hotkey: str,
+        recipient_uid: int | None = None,
+        metagraph_block: int | None = None,
+        metagraph_hash: str | None = None,
+        recipient_public_key: bytes | str | None = None,
+    ) -> EncryptedAssignmentGrantV3:
+        if recipient_public_key is None:
+            raise ValueError("recipient_public_key is required for ED25519 sealed-box grants")
+        try:
+            from nacl.public import SealedBox
+            from nacl.signing import VerifyKey
+        except ImportError as e:
+            raise ImportError("PyNaCl is required for ED25519 sealed-box assignment grants") from e
+
+        recipient_public_key_bytes = _key_material_to_bytes(recipient_public_key, "recipient_public_key")
+        plaintext = canonical_json(grant.to_dict())
+        ciphertext = SealedBox(VerifyKey(recipient_public_key_bytes).to_curve25519_public_key()).encrypt(plaintext)
+        return EncryptedAssignmentGrantV3(
+            job_id=grant.job_id,
+            run_id=grant.run_id,
+            recipient_hotkey=recipient_hotkey,
+            recipient_uid=recipient_uid,
+            metagraph_block=metagraph_block,
+            metagraph_hash=metagraph_hash or sha256_hex(recipient_hotkey.encode("utf-8")),
+            ciphertext_b64=base64.b64encode(ciphertext).decode("ascii"),
+            crypto_scheme=self.scheme,
+            recipient_public_key_hex=recipient_public_key_bytes.hex(),
+        )
+
+    def decrypt(self, encrypted: EncryptedAssignmentGrantV3, *, expected_hotkey: str) -> AssignmentGrantV3:
+        if encrypted.crypto_scheme != self.scheme:
+            raise ValueError(f"unsupported assignment scheme {encrypted.crypto_scheme!r}")
+        if encrypted.recipient_hotkey != expected_hotkey:
+            raise ValueError("assignment grant recipient hotkey mismatch")
+        if self.seed is None:
+            raise ValueError("ED25519 sealed-box decrypt requires a native hotkey seed")
+        try:
+            from nacl.public import SealedBox
+            from nacl.signing import SigningKey
+        except ImportError as e:
+            raise ImportError("PyNaCl is required for ED25519 sealed-box assignment grants") from e
+
+        signing_key = SigningKey(self.seed)
+        if encrypted.recipient_public_key_hex:
+            expected_public_key = bytes.fromhex(encrypted.recipient_public_key_hex)
+            if signing_key.verify_key.encode() != expected_public_key:
+                raise ValueError("assignment grant recipient public key does not match local hotkey")
+        ciphertext = base64.b64decode(encrypted.ciphertext_b64.encode("ascii"))
+        plaintext = SealedBox(signing_key.to_curve25519_private_key()).decrypt(ciphertext)
         return AssignmentGrantV3.from_dict(json.loads(plaintext.decode("utf-8")))
 
 

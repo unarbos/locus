@@ -24,6 +24,7 @@ class ValidatorNeuronConfig:
     wallet_name: str | None = None
     hotkey_name: str | None = None
     network: str | None = None
+    audit_mode: str = "local"
 
 
 class ValidatorNeuron:
@@ -54,7 +55,10 @@ class ValidatorNeuron:
         )
 
     def run_once(self, *, max_receipts: int | None = None, publish_weights: bool = False) -> dict:
-        checked = self.verifier.run_once(max_receipts=max_receipts)
+        if self.config.audit_mode == "consume":
+            checked = self.verifier.consume_audit_results(max_receipts=max_receipts)
+        else:
+            checked = self.verifier.run_once(max_receipts=max_receipts)
         windows = summarize_scores(
             self.bucket,
             netuid=self.config.netuid,

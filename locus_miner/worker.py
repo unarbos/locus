@@ -7,14 +7,16 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 from locus_core import paths
 from locus_core.protocol import AssignmentGrantV3, EncryptedAssignmentGrantV3, JobManifestV3, MinerIdentity, WorkerIdentity
-from locus_core.wallet_crypto import DevAssignmentCrypto
+from locus_core.wallet_crypto import AssignmentDecryptor, DevAssignmentCrypto, Ed25519SealedBoxAssignmentCrypto
+from locus_runtime.distributed_executor import DistributedJobExecutor
 from locus_runtime.executor import JobExecutor
 from locus_runtime.storage import ObjectStore
 from locus_runtime.transport import DirectArtifactTransport, PresignedArtifactTransport
-from .capabilities import detect_capabilities, gpu_index, probe_torch_device
+from .capabilities import detect_capabilities, device_indices, gpu_index, probe_torch_device
 
 
 @dataclass
@@ -24,6 +26,7 @@ class WorkerConfig:
     hotkey_ss58: str
     worker_id: str
     device: str = "cpu"
+    device_group: list[str] | None = None
     miner_secret: str = "miner-dev-secret"
     poll_interval: float = 0.1
     heartbeat_interval: float = 1.0
@@ -32,6 +35,10 @@ class WorkerConfig:
     encryption_secret: str = "locus-dev-encryption"
     grant_mode: str = "direct"
     assignment_secret: str = "locus-dev-assignment"
+    assignment_crypto: str = "dev"
+    wallet_path: str = "~/.bittensor/wallets"
+    wallet_name: str = ""
+    hotkey_name: str = ""
     max_idle_iters: int | None = None
 
 
@@ -39,12 +46,22 @@ class MinerWorker:
     def __init__(self, *, bucket: ObjectStore, config: WorkerConfig) -> None:
         self.bucket = bucket
         self.config = config
+        self.device_group = list(config.device_group or [config.device])
         self.stop_event = threading.Event()
         transport = DirectArtifactTransport(bucket) if config.grant_mode == "direct" else PresignedArtifactTransport(bucket)
-        self.executor = JobExecutor(bucket=bucket, device=config.device, encryption_secret=config.encryption_secret, transport=transport)
+        if len(self.device_group) > 1:
+            self.executor = DistributedJobExecutor(bucket=bucket, devices=self.device_group, encryption_secret=config.encryption_secret, transport=transport)
+        else:
+            self.executor = JobExecutor(bucket=bucket, device=config.device, encryption_secret=config.encryption_secret, transport=transport)
         self.transport = transport
-        self.assignment_crypto = DevAssignmentCrypto(config.assignment_secret)
-        self.capabilities = detect_capabilities(bucket, run_id=config.run_id, worker_id=config.worker_id, device=config.device)
+        self.assignment_crypto: AssignmentDecryptor = self._assignment_decryptor()
+        self.capabilities = detect_capabilities(
+            bucket,
+            run_id=config.run_id,
+            worker_id=config.worker_id,
+            device=config.device,
+            device_group=self.device_group,
+        )
         self.identity = WorkerIdentity(
             hotkey_ss58=config.hotkey_ss58,
             worker_id=config.worker_id,
@@ -52,14 +69,31 @@ class MinerWorker:
             gpu_index=gpu_index(config.device),
             session_nonce=str(uuid.uuid4()),
             software_hash=os.environ.get("LOCUS_SOFTWARE_HASH", "dev"),
+            device_group=device_indices(self.device_group),
+            worker_group_id=config.worker_id if len(self.device_group) > 1 else None,
+            capabilities=dict(self.capabilities),
         )
         self.last_heartbeat = 0.0
         self.idle_iters = 0
         self._gpu_probe()
         self.heartbeat(force=True)
 
+    def _assignment_decryptor(self) -> AssignmentDecryptor:
+        if self.config.assignment_crypto != "ed25519":
+            return DevAssignmentCrypto(self.config.assignment_secret)
+        if not self.config.wallet_name or not self.config.hotkey_name:
+            raise ValueError("ed25519 assignment crypto requires wallet_name and hotkey_name")
+        keyfile = (
+            Path(self.config.wallet_path).expanduser()
+            / self.config.wallet_name
+            / "hotkeys"
+            / self.config.hotkey_name
+        )
+        return Ed25519SealedBoxAssignmentCrypto.from_keyfile(keyfile)
+
     def _gpu_probe(self) -> None:
-        probe_torch_device(self.config.device)
+        for device in self.device_group:
+            probe_torch_device(device)
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -172,13 +206,18 @@ class MinerWorker:
             raise ValueError("assignment grant expired")
         put_uris = {g.canonical_uri for g in grant.output_puts}
         expected_outputs = {ref.uri for ref in manifest.outputs}
-        if put_uris != expected_outputs:
+        if not expected_outputs.issubset(put_uris):
             raise ValueError("assignment grant output URI mismatch")
         if grant.receipt_put is None:
             raise ValueError("assignment grant missing receipt PUT")
 
     def _eligible(self, manifest: JobManifestV3) -> bool:
         if manifest.assigned_hotkey != self.config.hotkey_ss58:
+            return False
+        req = manifest.resource_requirements
+        if req.min_gpus > 1 and len(self.device_group) < req.min_gpus:
+            return False
+        if req.placement == "single_host" and len(self.device_group) < req.min_gpus:
             return False
         return manifest.assigned_worker in (None, self.config.worker_id)
 

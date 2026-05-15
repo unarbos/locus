@@ -307,6 +307,71 @@ class ArtifactRef:
 
 
 @dataclass
+class ShardSpec:
+    rank: int
+    uri: str
+    offset: int = 0
+    length: int | None = None
+    sha256: str | None = None
+    size_bytes: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"rank": int(self.rank), "uri": self.uri, "offset": int(self.offset)}
+        if self.length is not None:
+            out["length"] = int(self.length)
+        if self.sha256 is not None:
+            out["sha256"] = self.sha256
+        if self.size_bytes is not None:
+            out["size_bytes"] = int(self.size_bytes)
+        return out
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> "ShardSpec":
+        return ShardSpec(
+            rank=int(d["rank"]),
+            uri=d["uri"],
+            offset=int(d.get("offset", 0)),
+            length=int(d["length"]) if d.get("length") is not None else None,
+            sha256=d.get("sha256"),
+            size_bytes=int(d["size_bytes"]) if d.get("size_bytes") is not None else None,
+        )
+
+
+@dataclass
+class ShardedTensorManifest:
+    name: str
+    shape: list[int]
+    dtype: str
+    partition_dim: int
+    world_size: int
+    shards: list[ShardSpec]
+    layout: str = "rank_sharded_v1"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "shape": [int(x) for x in self.shape],
+            "dtype": self.dtype,
+            "partition_dim": int(self.partition_dim),
+            "world_size": int(self.world_size),
+            "layout": self.layout,
+            "shards": [s.to_dict() for s in self.shards],
+        }
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> "ShardedTensorManifest":
+        return ShardedTensorManifest(
+            name=d["name"],
+            shape=[int(x) for x in d.get("shape", [])],
+            dtype=d["dtype"],
+            partition_dim=int(d.get("partition_dim", 0)),
+            world_size=int(d["world_size"]),
+            layout=d.get("layout", "rank_sharded_v1"),
+            shards=[ShardSpec.from_dict(x) for x in d.get("shards", [])],
+        )
+
+
+@dataclass
 class ArtifactDigest:
     name: str
     uri: str
@@ -317,6 +382,7 @@ class ArtifactDigest:
     envelope_sha256: str | None = None
     signature: str | None = None
     crypto_mode: str = CryptoMode.NONE.value
+    sharded: ShardedTensorManifest | None = None
 
     def to_dict(self) -> dict[str, Any]:
         out = {
@@ -330,6 +396,8 @@ class ArtifactDigest:
             value = getattr(self, key)
             if value is not None:
                 out[key] = value
+        if self.sharded is not None:
+            out["sharded"] = self.sharded.to_dict()
         return out
 
     @staticmethod
@@ -344,6 +412,7 @@ class ArtifactDigest:
             envelope_sha256=d.get("envelope_sha256"),
             signature=d.get("signature"),
             crypto_mode=d.get("crypto_mode", CryptoMode.NONE.value),
+            sharded=ShardedTensorManifest.from_dict(d["sharded"]) if d.get("sharded") else None,
         )
 
 
@@ -399,9 +468,12 @@ class WorkerIdentity:
     gpu_index: int | None
     session_nonce: str
     software_hash: str = "dev"
+    device_group: list[int] = field(default_factory=list)
+    worker_group_id: str | None = None
+    capabilities: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "hotkey_ss58": self.hotkey_ss58,
             "worker_id": self.worker_id,
             "host_id": self.host_id,
@@ -409,6 +481,13 @@ class WorkerIdentity:
             "session_nonce": self.session_nonce,
             "software_hash": self.software_hash,
         }
+        if self.device_group:
+            out["device_group"] = [int(x) for x in self.device_group]
+        if self.worker_group_id is not None:
+            out["worker_group_id"] = self.worker_group_id
+        if self.capabilities:
+            out["capabilities"] = dict(self.capabilities)
+        return out
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> "WorkerIdentity":
@@ -419,6 +498,37 @@ class WorkerIdentity:
             gpu_index=d.get("gpu_index"),
             session_nonce=d.get("session_nonce", "unknown"),
             software_hash=d.get("software_hash", "dev"),
+            device_group=[int(x) for x in d.get("device_group", [])],
+            worker_group_id=d.get("worker_group_id"),
+            capabilities=dict(d.get("capabilities") or {}),
+        )
+
+
+@dataclass
+class ResourceRequirements:
+    min_gpus: int = 1
+    placement: str = "single_worker"
+    parallelism: dict[str, Any] = field(default_factory=dict)
+
+    def is_default(self) -> bool:
+        return self.min_gpus == 1 and self.placement == "single_worker" and not self.parallelism
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "min_gpus": int(self.min_gpus),
+            "placement": self.placement,
+        }
+        if self.parallelism:
+            out["parallelism"] = dict(self.parallelism)
+        return out
+
+    @staticmethod
+    def from_dict(d: dict[str, Any] | None) -> "ResourceRequirements":
+        d = dict(d or {})
+        return ResourceRequirements(
+            min_gpus=int(d.get("min_gpus", 1)),
+            placement=d.get("placement", "single_worker"),
+            parallelism=dict(d.get("parallelism") or {}),
         )
 
 
@@ -472,12 +582,13 @@ class JobManifestV3:
     attempt: int
     deadline_unix: int
     created_unix: int
+    resource_requirements: ResourceRequirements = field(default_factory=ResourceRequirements)
     verification_policy: VerificationPolicy = field(default_factory=VerificationPolicy)
     owner_signature: str | None = None
     schema_version: int = 3
 
     def unsigned_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "schema_version": int(self.schema_version),
             "job_id": self.job_id,
             "run_id": self.run_id,
@@ -494,6 +605,9 @@ class JobManifestV3:
             "created_unix": int(self.created_unix),
             "verification_policy": self.verification_policy.to_dict(),
         }
+        if not self.resource_requirements.is_default():
+            out["resource_requirements"] = self.resource_requirements.to_dict()
+        return out
 
     def manifest_hash(self) -> str:
         return digest_dict(self.unsigned_dict())
@@ -525,6 +639,7 @@ class JobManifestV3:
             attempt=int(d.get("attempt", 0)),
             deadline_unix=int(d["deadline_unix"]),
             created_unix=int(d["created_unix"]),
+            resource_requirements=ResourceRequirements.from_dict(d.get("resource_requirements")),
             verification_policy=VerificationPolicy.from_dict(d.get("verification_policy")),
             owner_signature=d.get("owner_signature"),
         )
@@ -546,11 +661,12 @@ class JobReceiptV3:
     compute_sec: float
     claimed_bytes_read: int
     claimed_bytes_written: int
+    execution: dict[str, Any] = field(default_factory=dict)
     miner_signature: str | None = None
     schema_version: int = 3
 
     def unsigned_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "schema_version": int(self.schema_version),
             "receipt_id": self.receipt_id,
             "manifest_hash": self.manifest_hash,
@@ -567,6 +683,9 @@ class JobReceiptV3:
             "claimed_bytes_read": int(self.claimed_bytes_read),
             "claimed_bytes_written": int(self.claimed_bytes_written),
         }
+        if self.execution:
+            out["execution"] = dict(self.execution)
+        return out
 
     def sign(self, secret: str) -> "JobReceiptV3":
         self.miner_signature = sign_dict(self.unsigned_dict(), secret)
@@ -595,6 +714,7 @@ class JobReceiptV3:
             compute_sec=float(d.get("compute_sec", 0.0)),
             claimed_bytes_read=int(d.get("claimed_bytes_read", 0)),
             claimed_bytes_written=int(d.get("claimed_bytes_written", 0)),
+            execution=dict(d.get("execution") or {}),
             miner_signature=d.get("miner_signature"),
         )
 
@@ -662,6 +782,69 @@ class VerificationVerdictV3:
             checked_unix=float(d.get("checked_unix", 0.0)),
             comparison=dict(d.get("comparison") or {}),
             validator_signature=d.get("validator_signature"),
+        )
+
+
+@dataclass
+class AuditResultV3:
+    audit_id: str
+    receipt_id: str
+    manifest_hash: str
+    job_id: str
+    run_id: str
+    miner_hotkey: str
+    auditor_hotkey: str
+    status: str
+    reason: str
+    replay_compute_sec: float
+    checked_unix: float
+    comparison: dict[str, Any] = field(default_factory=dict)
+    auditor_signature: str | None = None
+    schema_version: int = 1
+
+    def unsigned_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": int(self.schema_version),
+            "audit_id": self.audit_id,
+            "receipt_id": self.receipt_id,
+            "manifest_hash": self.manifest_hash,
+            "job_id": self.job_id,
+            "run_id": self.run_id,
+            "miner_hotkey": self.miner_hotkey,
+            "auditor_hotkey": self.auditor_hotkey,
+            "status": self.status,
+            "reason": self.reason,
+            "replay_compute_sec": float(self.replay_compute_sec),
+            "checked_unix": float(self.checked_unix),
+            "comparison": dict(self.comparison),
+        }
+
+    def sign(self, secret: str) -> "AuditResultV3":
+        self.auditor_signature = sign_dict(self.unsigned_dict(), secret)
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        out = self.unsigned_dict()
+        out["auditor_signature"] = self.auditor_signature
+        return out
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> "AuditResultV3":
+        return AuditResultV3(
+            schema_version=int(d.get("schema_version", 1)),
+            audit_id=d["audit_id"],
+            receipt_id=d["receipt_id"],
+            manifest_hash=d["manifest_hash"],
+            job_id=d["job_id"],
+            run_id=d["run_id"],
+            miner_hotkey=d["miner_hotkey"],
+            auditor_hotkey=d["auditor_hotkey"],
+            status=d["status"],
+            reason=d.get("reason", ""),
+            replay_compute_sec=float(d.get("replay_compute_sec", 0.0)),
+            checked_unix=float(d.get("checked_unix", 0.0)),
+            comparison=dict(d.get("comparison") or {}),
+            auditor_signature=d.get("auditor_signature"),
         )
 
 

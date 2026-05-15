@@ -2,22 +2,17 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import random
 import time
 from dataclasses import dataclass
 from typing import Any
 
-import torch
-
 from locus_core import paths
-from locus_core.ir import Graph
-from locus_core.protocol import ArtifactDigest, ArtifactRef, JobManifestV3, JobReceiptV3, MinerScoreWindow, VerificationVerdictV3
-from locus_core.signatures import HmacSigner, verify_dict
-from locus_runtime import tensor_io
-from locus_runtime.crypto import decode_envelope, TimelockPending, DrandTimelockProvider
-from locus_runtime.eval import evaluate
+from locus_core.protocol import AuditResultV3, JobManifestV3, JobReceiptV3, MinerScoreWindow, VerificationVerdictV3
+from locus_core.signatures import verify_dict
+from locus_runtime.crypto import DrandTimelockProvider
 from locus_runtime.storage import ObjectStore
+from .audit import AuditReplayConfig, AuditReplayRunner
 
 
 @dataclass
@@ -39,7 +34,6 @@ class ReplayVerifier:
     def __init__(self, *, bucket: ObjectStore, config: ValidatorConfig) -> None:
         self.bucket = bucket
         self.config = config
-        self.graph_cache: dict[str, Graph] = {}
 
     def run_once(self, *, max_receipts: int | None = None) -> int:
         checked = 0
@@ -49,6 +43,26 @@ class ReplayVerifier:
             if self.has_verdict(receipt):
                 continue
             verdict = self.verify(uri, receipt)
+            self.bucket.put_json(
+                self.bucket.uri_for_key(paths.verdict_key(self.config.netuid, receipt.run_id, self.config.validator_hotkey, receipt.receipt_id)),
+                verdict.to_dict(),
+            )
+            checked += 1
+        return checked
+
+    def consume_audit_results(self, *, max_receipts: int | None = None) -> int:
+        checked = 0
+        for _uri, receipt in self.sample_receipts():
+            if max_receipts is not None and checked >= max_receipts:
+                break
+            if self.has_verdict(receipt):
+                continue
+            audit = self.find_audit_result(receipt)
+            if audit is None:
+                continue
+            if not self.verify_audit_result(audit, receipt):
+                continue
+            verdict = self.verdict_from_audit(receipt, audit)
             self.bucket.put_json(
                 self.bucket.uri_for_key(paths.verdict_key(self.config.netuid, receipt.run_id, self.config.validator_hotkey, receipt.receipt_id)),
                 verdict.to_dict(),
@@ -80,149 +94,67 @@ class ReplayVerifier:
         )
 
     def verify(self, receipt_uri: str, receipt: JobReceiptV3) -> VerificationVerdictV3:
-        t0 = time.time()
-        comparison: dict[str, Any] = {"receipt_uri": receipt_uri, "inputs": {}, "outputs": {}}
-        try:
-            manifest = self.find_manifest(receipt)
-            if not self.verify_manifest_signature(manifest):
-                return self.verdict(receipt, "fail", "bad owner signature", 0.0, comparison, t0)
-            if not self.verify_receipt_signature(receipt):
-                return self.verdict(receipt, "fail", "bad miner signature", 0.0, comparison, t0)
-            if manifest.manifest_hash() != receipt.manifest_hash:
-                return self.verdict(receipt, "fail", "manifest hash mismatch", 0.0, comparison, t0)
-            graph = self.fetch_graph(manifest.graph_ref.sha256, manifest.graph_ref.uri)
-            inputs = self.load_inputs(manifest.inputs, receipt.input_digests, comparison)
-            outputs = evaluate(graph, inputs, manifest.params, bucket=self.bucket, device=self.config.device)
-            replay_compute = time.time() - t0
-            ok = True
-            reasons: list[str] = []
-            for ref in manifest.outputs:
-                out_ok, out_cmp = self.compare_output(ref, outputs.get(ref.name), manifest)
-                comparison["outputs"][ref.name] = out_cmp
-                if not out_ok:
-                    ok = False
-                    reasons.append(f"{ref.name}: {out_cmp.get('reason')}")
-            status = "pass" if ok else "fail"
-            reason = "all outputs matched" if ok else "; ".join(reasons[:4])
-            return self.verdict(receipt, status, reason, replay_compute, comparison, t0)
-        except TimelockPending as e:
-            comparison["crypto_pending"] = str(e)
-            return self.verdict(receipt, "inconclusive", str(e), 0.0, comparison, t0)
-        except ValueError as e:
-            comparison["verification_error"] = str(e)
-            return self.verdict(receipt, "fail", str(e), 0.0, comparison, t0)
-        except Exception as e:
-            comparison["error"] = repr(e)
-            return self.verdict(receipt, "inconclusive", str(e), 0.0, comparison, t0)
+        audit = AuditReplayRunner(bucket=self.bucket, config=self.audit_config()).run(
+            receipt_uri=receipt_uri,
+            manifest=self.find_manifest(receipt),
+            receipt=receipt,
+            auditor_hotkey=self.config.validator_hotkey,
+        )
+        return self.verdict_from_audit(receipt, audit)
 
     def find_manifest(self, receipt: JobReceiptV3) -> JobManifestV3:
         uri = self.bucket.uri_for_key(paths.job_manifest_key(self.config.netuid, receipt.run_id, receipt.job_id))
         return JobManifestV3.from_dict(self.bucket.get_json(uri))
 
-    def verify_manifest_signature(self, manifest: JobManifestV3) -> bool:
-        if not manifest.owner_signature:
+    def audit_config(self) -> AuditReplayConfig:
+        return AuditReplayConfig(
+            owner_secret=self.config.owner_secret,
+            miner_secret=self.config.miner_secret,
+            device=self.config.device,
+            max_sample_elements=self.config.max_sample_elements,
+            encryption_secret=self.config.encryption_secret,
+            timelock_provider=self.config.timelock_provider,
+        )
+
+    def find_audit_result(self, receipt: JobReceiptV3) -> AuditResultV3 | None:
+        prefix = self.bucket.uri_for_key(paths.audit_results_prefix(self.config.netuid, receipt.run_id))
+        for uri in self.bucket.list(prefix):
+            if not uri.endswith(".json"):
+                continue
+            try:
+                audit = AuditResultV3.from_dict(self.bucket.get_json(uri))
+            except Exception:
+                continue
+            if audit.receipt_id == receipt.receipt_id:
+                return audit
+        return None
+
+    @staticmethod
+    def verify_audit_result(audit: AuditResultV3, receipt: JobReceiptV3) -> bool:
+        if not audit.auditor_signature:
             return False
-        return verify_dict(manifest.unsigned_dict(), self.config.owner_secret, manifest.owner_signature)
-
-    def verify_receipt_signature(self, receipt: JobReceiptV3) -> bool:
-        if not receipt.miner_signature:
+        if audit.receipt_id != receipt.receipt_id or audit.manifest_hash != receipt.manifest_hash:
             return False
-        return verify_dict(receipt.unsigned_dict(), self.config.miner_secret, receipt.miner_signature)
+        return verify_dict(audit.unsigned_dict(), audit.auditor_hotkey, audit.auditor_signature)
 
-    def fetch_graph(self, sha: str, uri: str) -> Graph:
-        cached = self.graph_cache.get(sha)
-        if cached is not None:
-            return cached
-        graph = Graph.from_dict(json.loads(self.bucket.get(uri).decode("utf-8")))
-        if graph.graph_id() != sha:
-            raise ValueError("graph hash mismatch")
-        self.graph_cache[sha] = graph
-        return graph
-
-    def load_inputs(
-        self,
-        refs: list[ArtifactRef],
-        digests: list[ArtifactDigest],
-        comparison: dict[str, Any],
-    ) -> dict[str, torch.Tensor]:
-        expected = {d.name: d for d in digests}
-        inputs: dict[str, torch.Tensor] = {}
-        for ref in refs:
-            body = self.bucket.get(ref.uri)
-            sha = hashlib.sha256(body).hexdigest()
-            exp = expected.get(ref.name)
-            comparison["inputs"][ref.name] = {
-                "sha256": sha,
-                "size_bytes": len(body),
-                "matches_receipt": exp is None or exp.sha256 == sha or exp.envelope_sha256 == sha,
-                "crypto_mode": ref.crypto.mode if ref.crypto else "none",
-            }
-            if exp is not None and exp.sha256 != sha and exp.envelope_sha256 != sha:
-                raise ValueError(f"input changed: {ref.name}")
-            body = decode_envelope(
-                body,
-                ref.crypto,
-                verifier=HmacSigner(self.config.miner_secret),
-                encryption_secret=self.config.encryption_secret,
-                timelock_provider=self.config.timelock_provider,
-            )
-            inputs[ref.name] = tensor_io.decode_tensor(body).to(self.config.device)
-        return inputs
-
-    def compare_output(self, ref: ArtifactRef, expected_value: Any, manifest: JobManifestV3) -> tuple[bool, dict[str, Any]]:
-        if expected_value is None:
-            return False, {"status": "fail", "reason": "missing replay output"}
-        if ref.uri.endswith(".json"):
-            observed_body = decode_envelope(
-                self.bucket.get(ref.uri),
-                ref.crypto,
-                verifier=HmacSigner(self.config.miner_secret),
-                encryption_secret=self.config.encryption_secret,
-                timelock_provider=self.config.timelock_provider,
-            )
-            observed_json = json.loads(observed_body.decode("utf-8"))
-            observed = torch.as_tensor(observed_json.get("value"), device=self.config.device)
-        else:
-            observed_body = decode_envelope(
-                self.bucket.get(ref.uri),
-                ref.crypto,
-                verifier=HmacSigner(self.config.miner_secret),
-                encryption_secret=self.config.encryption_secret,
-                timelock_provider=self.config.timelock_provider,
-            )
-            observed = tensor_io.decode_tensor(observed_body).to(self.config.device)
-        if not isinstance(expected_value, torch.Tensor):
-            return False, {"status": "fail", "reason": "non-tensor replay output"}
-        expected = expected_value.detach().to(self.config.device)
-        if list(observed.shape) != list(expected.shape):
-            return False, {"status": "fail", "reason": "shape mismatch"}
-        policy = manifest.verification_policy
-        obs = observed.reshape(-1)
-        exp = expected.reshape(-1)
-        total = int(obs.numel())
-        if 0 < policy.max_sample_elements < total:
-            rng = random.Random(policy.sample_seed)
-            idx = torch.as_tensor(rng.sample(range(total), policy.max_sample_elements), device=self.config.device)
-            obs = obs.index_select(0, idx)
-            exp = exp.index_select(0, idx)
-        comparator = policy.comparator
-        if comparator == "auto":
-            comparator = "allclose" if expected.dtype.is_floating_point else "exact"
-        if comparator == "exact":
-            ok = bool(torch.equal(obs.cpu(), exp.cpu()))
-            max_abs = 0.0 if ok else float((obs.to(torch.float32) - exp.to(torch.float32)).abs().max().item())
-        else:
-            ok = bool(torch.allclose(obs.to(torch.float32), exp.to(torch.float32), rtol=policy.rtol, atol=policy.atol))
-            max_abs = 0.0 if obs.numel() == 0 else float((obs.to(torch.float32) - exp.to(torch.float32)).abs().max().item())
-        return ok, {
-            "status": "pass" if ok else "fail",
-            "reason": "matched" if ok else "tensor mismatch",
-            "comparator": comparator,
-            "checked_elements": int(obs.numel()),
-            "total_elements": total,
-            "max_abs_error": max_abs,
-            "crypto_mode": ref.crypto.mode if ref.crypto else "none",
-        }
+    def verdict_from_audit(self, receipt: JobReceiptV3, audit: AuditResultV3) -> VerificationVerdictV3:
+        estimated_cu = estimate_cu(receipt, audit.replay_compute_sec)
+        verdict = VerificationVerdictV3(
+            verdict_id=f"{self.config.validator_hotkey}:{receipt.receipt_id}",
+            receipt_id=receipt.receipt_id,
+            manifest_hash=receipt.manifest_hash,
+            job_id=receipt.job_id,
+            run_id=receipt.run_id,
+            miner_hotkey=receipt.worker.hotkey_ss58,
+            validator_hotkey=self.config.validator_hotkey,
+            status=audit.status,
+            reason=audit.reason,
+            estimated_cu=estimated_cu,
+            replay_compute_sec=audit.replay_compute_sec,
+            checked_unix=time.time(),
+            comparison={"audit": audit.to_dict()},
+        )
+        return verdict.sign(self.config.validator_secret)
 
     def verdict(
         self,

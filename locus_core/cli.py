@@ -14,6 +14,7 @@ from locus_orchestrator.run_manager import RunConfig, RunManager
 from locus_orchestrator.streaming import StreamingRunConfig, StreamingRunManager
 from locus_runtime.lifecycle import wipe_run
 from locus_runtime.storage import S3Bucket, open_local_bucket
+from locus_validator.audit_jobs import AuditJobConfig, AuditJobManager
 from locus_validator.ledger import summarize_ledger
 from locus_validator.neuron import ValidatorNeuron, ValidatorNeuronConfig
 
@@ -64,6 +65,7 @@ def cmd_local_smoke(args: argparse.Namespace) -> int:
                     fault_rate=args.fault_rate,
                     miner_secret=args.miner_secret,
                     encryption_secret=args.encryption_secret,
+                    assignment_crypto=args.assignment_crypto,
                 ),
             )
         )
@@ -84,6 +86,8 @@ def cmd_local_smoke(args: argparse.Namespace) -> int:
             grant_mode=args.grant_mode,
             grant_ttl_sec=args.grant_ttl_sec,
             assignment_secret=args.assignment_secret,
+            assignment_crypto=args.assignment_crypto,
+            network=args.network,
         ),
     )
     orch.run_loop(timeout_sec=args.timeout_sec)
@@ -101,6 +105,7 @@ def cmd_local_smoke(args: argparse.Namespace) -> int:
             miner_secret=args.miner_secret,
             validator_secret=args.validator_secret,
             encryption_secret=args.encryption_secret,
+            audit_mode="local",
         ),
     )
     result = validator.run_once(max_receipts=10_000, publish_weights=True)
@@ -123,6 +128,8 @@ def cmd_orchestrator(args: argparse.Namespace) -> int:
                 grant_mode=args.grant_mode,
                 grant_ttl_sec=args.grant_ttl_sec,
                 assignment_secret=args.assignment_secret,
+                assignment_crypto=args.assignment_crypto,
+                network=args.network,
             ),
         )
         manager.run_loop(poll_interval=args.poll_interval, timeout_sec=args.timeout_sec)
@@ -139,6 +146,8 @@ def cmd_orchestrator(args: argparse.Namespace) -> int:
             grant_mode=args.grant_mode,
             grant_ttl_sec=args.grant_ttl_sec,
             assignment_secret=args.assignment_secret,
+            assignment_crypto=args.assignment_crypto,
+            network=args.network,
         ),
     )
     manager.run_loop(poll_interval=args.poll_interval, timeout_sec=args.timeout_sec)
@@ -148,6 +157,7 @@ def cmd_orchestrator(args: argparse.Namespace) -> int:
 def cmd_miner(args: argparse.Namespace) -> int:
     bucket = build_bucket(args)
     devices = args.devices.split(",") if args.devices else ["cpu"]
+    device_group = args.device_group.split(",") if args.device_group else None
     miner = MinerNeuron(
         bucket=bucket,
         config=MinerNeuronConfig(
@@ -155,6 +165,7 @@ def cmd_miner(args: argparse.Namespace) -> int:
             run_id=args.run_id,
             hotkey_ss58=args.hotkey,
             devices=devices,
+            device_group=device_group,
             poll_interval=args.poll_interval,
             fault_mode=args.fault_mode,
             fault_rate=args.fault_rate,
@@ -162,6 +173,10 @@ def cmd_miner(args: argparse.Namespace) -> int:
             encryption_secret=args.encryption_secret,
             grant_mode=args.grant_mode,
             assignment_secret=args.assignment_secret,
+            assignment_crypto=args.assignment_crypto,
+            wallet_path=args.wallet_path,
+            wallet_name=args.wallet_name,
+            hotkey_name=args.hotkey_name,
         ),
     )
     try:
@@ -189,10 +204,33 @@ def cmd_validator(args: argparse.Namespace) -> int:
             miner_secret=args.miner_secret,
             validator_secret=args.validator_secret,
             encryption_secret=args.encryption_secret,
+            audit_mode=args.audit_mode,
         ),
     )
     result = validator.run_once(max_receipts=args.max_receipts, publish_weights=args.publish_weights)
     print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_audit_jobs(args: argparse.Namespace) -> int:
+    bucket = build_bucket(args)
+    manager = AuditJobManager(
+        bucket=bucket,
+        config=AuditJobConfig(
+            netuid=args.netuid,
+            run_id=args.run_id,
+            validator_hotkey=args.validator_hotkey,
+            owner_secret=args.owner_secret,
+            assignment_secret=args.assignment_secret,
+            assignment_crypto=args.assignment_crypto,
+            network=args.network,
+            grant_mode=args.grant_mode,
+            grant_ttl_sec=args.grant_ttl_sec,
+            sample_rate=args.sample_rate,
+        ),
+    )
+    emitted = manager.run_once(max_jobs=args.max_jobs)
+    print(json.dumps({"emitted": emitted, "netuid": args.netuid, "run_id": args.run_id}, sort_keys=True))
     return 0
 
 
@@ -237,6 +275,7 @@ def add_grant_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--grant-mode", choices=["direct", "local", "presigned"], default="direct")
     p.add_argument("--grant-ttl-sec", type=int, default=600)
     p.add_argument("--assignment-secret", default=os.environ.get("LOCUS_ASSIGNMENT_SECRET", "locus-dev-assignment"))
+    p.add_argument("--assignment-crypto", choices=["dev", "ed25519"], default=os.environ.get("LOCUS_ASSIGNMENT_CRYPTO", "dev"))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -256,6 +295,7 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--fault-rate", type=float, default=1.0)
     smoke.add_argument("--sample-rate", type=float, default=1.0)
     smoke.add_argument("--timeout-sec", type=float, default=60.0)
+    smoke.add_argument("--network", default="finney")
     smoke.add_argument("--owner-secret", default=os.environ.get("LOCUS_OWNER_SECRET", "owner-dev-secret"))
     smoke.add_argument("--miner-secret", default=os.environ.get("LOCUS_MINER_SECRET", "miner-dev-secret"))
     smoke.add_argument("--validator-secret", default=os.environ.get("LOCUS_VALIDATOR_SECRET", "validator-dev-secret"))
@@ -272,6 +312,7 @@ def build_parser() -> argparse.ArgumentParser:
     orch.add_argument("--steps", type=int, default=1)
     orch.add_argument("--poll-interval", type=float, default=0.1)
     orch.add_argument("--timeout-sec", type=float, default=600.0)
+    orch.add_argument("--network", default="finney")
     orch.add_argument("--owner-secret", default=os.environ.get("LOCUS_OWNER_SECRET", "owner-dev-secret"))
     add_crypto_args(orch)
     add_grant_args(orch)
@@ -283,11 +324,15 @@ def build_parser() -> argparse.ArgumentParser:
     miner.add_argument("--run-id", required=True)
     miner.add_argument("--hotkey", required=True)
     miner.add_argument("--devices", default="cpu")
+    miner.add_argument("--device-group", default="", help="Comma-separated GPUs that should execute as one multi-GPU worker group.")
     miner.add_argument("--poll-interval", type=float, default=0.1)
     miner.add_argument("--fault-mode", default="")
     miner.add_argument("--fault-rate", type=float, default=1.0)
     miner.add_argument("--miner-secret", default=os.environ.get("LOCUS_MINER_SECRET", "miner-dev-secret"))
     miner.add_argument("--encryption-secret", default=os.environ.get("LOCUS_ENCRYPTION_SECRET", "locus-dev-encryption"))
+    miner.add_argument("--wallet-path", default=os.environ.get("BT_WALLET_PATH", "~/.bittensor/wallets"))
+    miner.add_argument("--wallet-name", default=os.environ.get("BT_WALLET_NAME", ""))
+    miner.add_argument("--hotkey-name", default=os.environ.get("BT_HOTKEY_NAME", ""))
     add_grant_args(miner)
     miner.set_defaults(fn=cmd_miner)
 
@@ -308,7 +353,20 @@ def build_parser() -> argparse.ArgumentParser:
     val.add_argument("--miner-secret", default=os.environ.get("LOCUS_MINER_SECRET", "miner-dev-secret"))
     val.add_argument("--validator-secret", default=os.environ.get("LOCUS_VALIDATOR_SECRET", "validator-dev-secret"))
     val.add_argument("--encryption-secret", default=os.environ.get("LOCUS_ENCRYPTION_SECRET", "locus-dev-encryption"))
+    val.add_argument("--audit-mode", choices=["local", "consume"], default="local")
     val.set_defaults(fn=cmd_validator)
+
+    audit = sub.add_parser("audit-jobs")
+    add_bucket_args(audit)
+    audit.add_argument("--netuid", type=int, default=0)
+    audit.add_argument("--run-id", required=True)
+    audit.add_argument("--validator-hotkey", default="validator0")
+    audit.add_argument("--sample-rate", type=float, default=1.0)
+    audit.add_argument("--max-jobs", type=int, default=None)
+    audit.add_argument("--network", default="finney")
+    audit.add_argument("--owner-secret", default=os.environ.get("LOCUS_OWNER_SECRET", "owner-dev-secret"))
+    add_grant_args(audit)
+    audit.set_defaults(fn=cmd_audit_jobs)
 
     wipe = sub.add_parser("wipe-run")
     add_bucket_args(wipe)

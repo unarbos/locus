@@ -18,6 +18,7 @@ class MinerNeuronConfig:
     run_id: str
     hotkey_ss58: str
     devices: list[str]
+    device_group: list[str] | None = None
     miner_secret: str = "miner-dev-secret"
     poll_interval: float = 0.1
     fault_mode: str = ""
@@ -25,32 +26,66 @@ class MinerNeuronConfig:
     encryption_secret: str = "locus-dev-encryption"
     grant_mode: str = "direct"
     assignment_secret: str = "locus-dev-assignment"
+    assignment_crypto: str = "dev"
+    wallet_path: str = "~/.bittensor/wallets"
+    wallet_name: str = ""
+    hotkey_name: str = ""
 
 
 class MinerNeuron:
     def __init__(self, *, bucket: ObjectStore, config: MinerNeuronConfig) -> None:
         self.bucket = bucket
         self.config = config
-        self.workers = [
-            MinerWorker(
-                bucket=bucket,
-                config=WorkerConfig(
-                    netuid=config.netuid,
-                    run_id=config.run_id,
-                    hotkey_ss58=config.hotkey_ss58,
-                    worker_id=f"{config.hotkey_ss58}-gpu{i}",
-                    device=device,
-                    miner_secret=config.miner_secret,
-                    poll_interval=config.poll_interval,
-                    fault_mode=config.fault_mode,
-                    fault_rate=config.fault_rate,
-                    encryption_secret=config.encryption_secret,
-                    grant_mode=config.grant_mode,
-                    assignment_secret=config.assignment_secret,
-                ),
-            )
-            for i, device in enumerate(config.devices)
-        ]
+        if config.device_group:
+            self.workers = [
+                MinerWorker(
+                    bucket=bucket,
+                    config=WorkerConfig(
+                        netuid=config.netuid,
+                        run_id=config.run_id,
+                        hotkey_ss58=config.hotkey_ss58,
+                        worker_id=f"{config.hotkey_ss58}-group0",
+                        device=config.device_group[0],
+                        device_group=config.device_group,
+                        miner_secret=config.miner_secret,
+                        poll_interval=config.poll_interval,
+                        fault_mode=config.fault_mode,
+                        fault_rate=config.fault_rate,
+                        encryption_secret=config.encryption_secret,
+                        grant_mode=config.grant_mode,
+                        assignment_secret=config.assignment_secret,
+                        assignment_crypto=config.assignment_crypto,
+                        wallet_path=config.wallet_path,
+                        wallet_name=config.wallet_name,
+                        hotkey_name=config.hotkey_name,
+                    ),
+                )
+            ]
+        else:
+            self.workers = [
+                MinerWorker(
+                    bucket=bucket,
+                    config=WorkerConfig(
+                        netuid=config.netuid,
+                        run_id=config.run_id,
+                        hotkey_ss58=config.hotkey_ss58,
+                        worker_id=f"{config.hotkey_ss58}-gpu{i}",
+                        device=device,
+                        miner_secret=config.miner_secret,
+                        poll_interval=config.poll_interval,
+                        fault_mode=config.fault_mode,
+                        fault_rate=config.fault_rate,
+                        encryption_secret=config.encryption_secret,
+                        grant_mode=config.grant_mode,
+                        assignment_secret=config.assignment_secret,
+                        assignment_crypto=config.assignment_crypto,
+                        wallet_path=config.wallet_path,
+                        wallet_name=config.wallet_name,
+                        hotkey_name=config.hotkey_name,
+                    ),
+                )
+                for i, device in enumerate(config.devices)
+            ]
 
     def loop(self) -> None:
         threads = [threading.Thread(target=w.loop, daemon=True) for w in self.workers]
